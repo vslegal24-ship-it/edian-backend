@@ -13,6 +13,8 @@ WORKDIR /app
 
 COPY package*.json ./
 RUN npm install --omit=dev
+
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/pw-browsers
 RUN npx playwright install chromium
 RUN npx playwright install-deps chromium
 
