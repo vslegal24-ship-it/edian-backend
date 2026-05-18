@@ -42,4 +42,5 @@ COPY . .
 
 EXPOSE 3001
 
+# Build: 20260518204220
 CMD ["node", "src/index.js"]
