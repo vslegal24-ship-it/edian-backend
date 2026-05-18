@@ -136,10 +136,16 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
         htmlDebug = document.body.innerHTML.substring(0, 3000);
       }
 
-      return { filas: filas, htmlDebug: htmlDebug };
+      // DEBUG: capturar HTML de la primera fila para ver estructura
+      var primeraFila = '';
+      var firstRow = document.querySelector('table tbody tr, tbody tr');
+      if (firstRow) primeraFila = firstRow.innerHTML.substring(0, 2000);
+
+      return { filas: filas, htmlDebug: htmlDebug, primeraFila: primeraFila };
     });
 
     console.log('[DIAN] Filas encontradas: ' + resultado.filas.length);
+    console.log('[DIAN] Primera fila HTML:', resultado.primeraFila ? resultado.primeraFila.substring(0,800) : 'vacia');
     if (resultado.filas.length === 0) {
       console.log('[DIAN] HTML debug:', resultado.htmlDebug.substring(0, 800));
     }
