@@ -16,7 +16,6 @@ function parseTokenUrl(url) {
 }
 
 function toFechaDIAN(iso) {
-  // 2026-05-01 → 5/1/2026 12:00:00 AM
   const [y, m, d] = iso.split('-');
   return parseInt(m) + '/' + parseInt(d) + '/' + y + ' 12:00:00 AM';
 }
@@ -47,154 +46,125 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
 
     // 2. Navegar a documentos recibidos
     await page.goto('https://catalogo-vpfe.dian.gov.co/Document/Received', { waitUntil: 'networkidle', timeout: 30000 });
-    console.log('[DIAN] Pagina cargada: ' + page.url());
+    console.log('[DIAN] Pagina cargada');
 
-    // 3. Inyectar las fechas directamente en los campos ocultos del formulario
-    //    y disparar la busqueda via JavaScript (sin page.fill, sin interaccion UI)
+    // 3. Inyectar fechas y hacer clic en Buscar
     const startDate = toFechaDIAN(fechaInicio);
     const endDate   = toFechaDIAN(fechaFin);
-    console.log('[DIAN] Fechas: ' + startDate + ' → ' + endDate);
+    console.log('[DIAN] Fechas: ' + startDate + ' -> ' + endDate);
 
-    await page.evaluate(function(params) {
-      // Setear los campos ocultos que usa el formulario DIAN
-      var startEl = document.getElementById('startDate');
-      var endEl   = document.getElementById('endDate');
-      var rangeEl = document.getElementById('dashboard-report-range');
+    await page.evaluate(function(p) {
+      var s = document.getElementById('startDate');
+      var e = document.getElementById('endDate');
+      var r = document.getElementById('dashboard-report-range');
+      if (s) s.value = p.start;
+      if (e) e.value = p.end;
+      if (r) r.value = p.startISO + ' - ' + p.endISO;
+    }, { start: startDate, end: endDate, startISO: fechaInicio, endISO: fechaFin });
 
-      if (startEl) startEl.value = params.start;
-      if (endEl)   endEl.value   = params.end;
-      if (rangeEl) rangeEl.value = params.startISO + ' - ' + params.endISO;
-
-      console.log('Campos seteados:', startEl ? startEl.value : 'NO ENCONTRADO');
-    }, {
-      start: startDate,
-      end: endDate,
-      startISO: fechaInicio,
-      endISO: fechaFin,
+    await page.evaluate(function() {
+      var btns = Array.from(document.querySelectorAll('button, input[type=submit]'));
+      var b = btns.find(function(x) {
+        return (x.textContent + (x.value||'')).toLowerCase().includes('buscar');
+      });
+      if (b) b.click();
+      else { var f = document.querySelector('form'); if (f) f.submit(); }
     });
 
-    // 4. Hacer clic en el boton Buscar y esperar resultados AJAX
-    console.log('[DIAN] Haciendo clic en Buscar...');
-    await Promise.all([
-      page.waitForResponse(function(resp) {
-        return resp.url().includes('/Document/') && resp.status() === 200;
-      }, { timeout: 20000 }).catch(function() { return null; }),
-      page.evaluate(function() {
-        // Buscar el boton de busqueda por texto o tipo
-        var btns = Array.from(document.querySelectorAll('button, input[type=submit]'));
-        var buscar = btns.find(function(b) {
-          var t = (b.textContent || b.value || '').toLowerCase();
-          return t.includes('buscar') || t.includes('search') || t.includes('consultar');
-        });
-        if (buscar) {
-          buscar.click();
-          return 'click en: ' + (buscar.textContent || buscar.value);
-        }
-        // Si no hay boton, submit del formulario
-        var form = document.querySelector('form');
-        if (form) { form.submit(); return 'form.submit()'; }
-        return 'no encontrado';
-      }),
-    ]);
+    await page.waitForTimeout(5000);
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(function(){});
 
-    // Esperar a que carguen los resultados
-    await page.waitForTimeout(4000);
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(function() {});
-
-    // 5. Extraer todos los documentos de la tabla
-    const resultado = await page.evaluate(function() {
-      var filas = [];
-      // Intentar con diferentes selectores de tabla
-      var selectores = [
-        'table#tbl-documents tbody tr',
-        'table.table tbody tr',
-        '.results-container tr',
-        'table tbody tr',
-        'tbody tr',
-      ];
-      var rows = [];
-      for (var i = 0; i < selectores.length; i++) {
-        rows = document.querySelectorAll(selectores[i]);
-        if (rows.length > 0) {
-          console.log('Tabla encontrada con: ' + selectores[i] + ' (' + rows.length + ' filas)');
-          break;
-        }
-      }
+    // 4. Extraer filas con el data-id del boton de descarga
+    const filas = await page.evaluate(function() {
+      var resultado = [];
+      var rows = document.querySelectorAll('table tbody tr, tbody tr');
       rows.forEach(function(tr) {
         var cells = Array.from(tr.querySelectorAll('td')).map(function(td) {
           return td.textContent.trim().replace(/\s+/g, ' ');
         });
-        var links = Array.from(tr.querySelectorAll('a')).map(function(a) {
-          return { href: a.href, text: a.textContent.trim(), title: a.getAttribute('title') || '' };
-        });
-        if (cells.length > 2) filas.push({ cells: cells, links: links });
+        // Buscar el boton con data-id (CUFE)
+        var btn = tr.querySelector('button.download-document, button[data-id]');
+        var cufe = btn ? (btn.getAttribute('data-id') || btn.id || '') : '';
+
+        if (cells.length > 2 && cufe) {
+          resultado.push({ cells: cells, cufe: cufe });
+        }
       });
-
-      // Capturar HTML para debug si no hay resultados
-      var htmlDebug = '';
-      if (filas.length === 0) {
-        htmlDebug = document.body.innerHTML.substring(0, 3000);
-      }
-
-      // DEBUG: capturar HTML de la primera fila para ver estructura
-      var primeraFila = '';
-      var firstRow = document.querySelector('table tbody tr, tbody tr');
-      if (firstRow) primeraFila = firstRow.innerHTML.substring(0, 2000);
-
-      return { filas: filas, htmlDebug: htmlDebug, primeraFila: primeraFila };
+      return resultado;
     });
 
-    console.log('[DIAN] Filas encontradas: ' + resultado.filas.length);
-    console.log('[DIAN] Primera fila HTML:', resultado.primeraFila ? resultado.primeraFila.substring(0,800) : 'vacia');
-    if (resultado.filas.length === 0) {
-      console.log('[DIAN] HTML debug:', resultado.htmlDebug.substring(0, 800));
-    }
+    console.log('[DIAN] Documentos con CUFE: ' + filas.length);
 
-    // 6. Descargar ZIP de cada documento
+    // 5. Descargar cada documento usando el endpoint de descarga de la DIAN
+    // El boton download-document usa el CUFE para descargar via POST o GET
     const documentos = [];
-    for (var i = 0; i < resultado.filas.length; i++) {
-      var fila = resultado.filas[i];
-      var linkZip = fila.links.find(function(l) {
-        var h = (l.href || '').toLowerCase();
-        return h.includes('download') || h.includes('zip') || h.includes('getfile') || h.includes('documento');
-      });
-      if (!linkZip) {
-        console.log('[DIAN] Fila ' + i + ' sin link de descarga. Links:', JSON.stringify(fila.links));
-        continue;
-      }
+
+    for (var i = 0; i < filas.length; i++) {
+      var fila = filas[i];
+      var cufe = fila.cufe;
+      var cells = fila.cells;
+
+      // Extraer datos de las celdas
+      // Estructura: [boton, fecha_recep, fecha_emis, prefijo, folio, tipo, nit_emisor, nom_emisor, nit_receptor, nom_receptor, total, estado, grupo, acciones]
+      var fecha   = cells[2] || cells[1] || '';
+      var prefijo = cells[3] || '';
+      var folio   = cells[4] || '';
+      var tipo    = cells[5] || 'Factura electronica';
+      var nitEmi  = cells[6] || '';
+      var nomEmi  = cells[7] || '';
+      var nitRec  = cells[8] || nit;
+      var nomRec  = cells[9] || '';
+      var nombre  = (prefijo ? prefijo + '-' : '') + folio;
+
+      console.log('[DIAN] Descargando: ' + nombre + ' (' + cufe.substring(0,16) + '...)');
+
       try {
+        // Hacer clic en el boton de descarga via JavaScript
         var dl = await Promise.all([
           page.waitForEvent('download', { timeout: 30000 }),
-          page.goto(linkZip.href),
+          page.evaluate(function(cuf) {
+            var btn = document.getElementById(cuf) ||
+                      document.querySelector('button[data-id="'+cuf+'"]');
+            if (btn) { btn.click(); return true; }
+            return false;
+          }, cufe),
         ]);
+
         var pathDl = await dl[0].path();
         var buffer = fs.readFileSync(pathDl);
-        var zip = await JSZip.loadAsync(buffer);
+        var suggestedName = dl[0].suggestedFilename();
+        console.log('[DIAN] Archivo: ' + suggestedName + ' (' + buffer.length + ' bytes)');
+
         var pdfBuffer = null, xmlBuffer = null, xmlText = '';
-        for (var entry of Object.entries(zip.files)) {
-          var fname = entry[0]; var file = entry[1];
-          if (fname.toLowerCase().endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
-          if (fname.toLowerCase().endsWith('.xml')) {
-            xmlBuffer = await file.async('nodebuffer');
-            xmlText = await file.async('text');
+
+        // Intentar leer como ZIP
+        try {
+          var zip = await JSZip.loadAsync(buffer);
+          for (var entry of Object.entries(zip.files)) {
+            var fname = entry[0]; var file = entry[1];
+            if (fname.toLowerCase().endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
+            if (fname.toLowerCase().endsWith('.xml')) {
+              xmlBuffer = await file.async('nodebuffer');
+              xmlText = await file.async('text');
+            }
           }
+        } catch(zipErr) {
+          // Si no es ZIP, puede ser directamente XML o PDF
+          var ext = (suggestedName || '').toLowerCase();
+          if (ext.endsWith('.xml')) { xmlBuffer = buffer; xmlText = buffer.toString('utf8'); }
+          if (ext.endsWith('.pdf')) pdfBuffer = buffer;
         }
-        var folio = fila.cells[2] || fila.cells[1] || 'doc-' + i;
-        documentos.push({
-          cufe: fila.cells[1]||'', folio, tipo: fila.cells[0]||'',
-          fecha: fila.cells[7]||fila.cells[3]||'',
-          pdfBuffer, xmlBuffer, xmlText, nombre: folio,
-        });
-        console.log('  [OK] ' + folio);
-        // Volver a la pagina de resultados para continuar
-        await page.goto('https://catalogo-vpfe.dian.gov.co/Document/Received', { waitUntil: 'networkidle', timeout: 20000 });
+
+        documentos.push({ cufe, cufeUrl: 'https://catalogo-vpfe.dian.gov.co/document/searchqr?documentkey='+cufe, folio: nombre, nombre, tipo, fecha, nitEmisor: nitEmi, nomEmisor: nomEmi, nitReceptor: nitRec, nomReceptor: nomRec, pdfBuffer, xmlBuffer, xmlText });
+        console.log('  [OK] ' + nombre);
+
       } catch(err) {
-        console.error('  [ERR] Fila ' + i + ':', err.message);
+        console.error('  [ERR] ' + nombre + ':', err.message);
       }
     }
 
-    console.log('[DIAN] Total descargados: ' + documentos.length);
-    return { documentos, nit, total: documentos.length, filasEncontradas: resultado.filas.length };
+    console.log('[DIAN] Total descargados: ' + documentos.length + ' de ' + filas.length);
+    return { documentos, nit, total: documentos.length, filasEncontradas: filas.length };
 
   } finally {
     await browser.close();
@@ -203,10 +173,7 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
 
 async function diagnosticarPortal(tokenUrl) {
   const { nit, token, pk } = parseTokenUrl(tokenUrl);
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu'],
-  });
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage'] });
   const context = await browser.newContext({ userAgent: 'Mozilla/5.0 Chrome/120' });
   const page = await context.newPage();
   try {
@@ -214,21 +181,15 @@ async function diagnosticarPortal(tokenUrl) {
     await page.goto('https://catalogo-vpfe.dian.gov.co/Document/Received', { waitUntil: 'networkidle', timeout: 30000 });
     const info = await page.evaluate(function() {
       return {
-        url: window.location.href,
-        titulo: document.title,
+        url: window.location.href, titulo: document.title,
         inputs: Array.from(document.querySelectorAll('input,select')).map(function(el) {
-          return { id: el.id, name: el.name, type: el.type, value: el.value.substring(0,80), placeholder: el.placeholder };
+          return { id: el.id, name: el.name, type: el.type, value: el.value.substring(0,80) };
         }),
-        botones: Array.from(document.querySelectorAll('button,input[type=submit]')).map(function(el) {
-          return { id: el.id, text: (el.textContent||el.value||'').trim().substring(0,60), cls: el.className.substring(0,60) };
-        }),
-        html: document.body.innerHTML.substring(0, 6000),
+        html: document.body.innerHTML.substring(0, 5000),
       };
     });
     return { ok: true, nit, ...info };
-  } finally {
-    await browser.close();
-  }
+  } finally { await browser.close(); }
 }
 
 module.exports = { descargarDIAN, diagnosticarPortal, parseTokenUrl };
