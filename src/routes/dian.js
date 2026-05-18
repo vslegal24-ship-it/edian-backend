@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { descargarDIAN, exportarExcelDIAN, parseTokenUrl } = require('../services/dianScraper');
+const { descargarDIAN, diagnosticarPortal, parseTokenUrl } = require('../services/dianScraper');
 const { procesarLote } = require('../services/xmlParser');
 const { generarExcelItems, generarExcelResumen } = require('../utils/excelGenerator');
 
@@ -111,6 +111,21 @@ router.post('/excel-resumen', (req, res) => {
     res.send(buffer);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/dian/diagnosticar
+ * Autentica y retorna la estructura HTML del portal para debug
+ */
+router.post('/diagnosticar', async (req, res) => {
+  const { tokenUrl } = req.body;
+  if (!tokenUrl) return res.status(400).json({ error: 'tokenUrl requerido' });
+  try {
+    const info = await diagnosticarPortal(tokenUrl);
+    res.json(info);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 

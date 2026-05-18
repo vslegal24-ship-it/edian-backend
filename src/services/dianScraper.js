@@ -1,196 +1,139 @@
 const { chromium } = require('playwright');
 const JSZip = require('jszip');
+const fs = require('fs');
 
-/**
- * parseTokenUrl - extrae NIT (rk) y token UUID del enlace del correo DIAN
- */
 function parseTokenUrl(url) {
   try {
     const u = new URL(url.trim());
-    const rk    = u.searchParams.get('rk');    // NIT receptor
-    const token = u.searchParams.get('token'); // UUID del token
-    const pk    = u.searchParams.get('pk');    // pk = idInterno|NIT
-    if (!rk || !token) throw new Error('URL inválida: faltan parámetros rk o token');
-    return { nit: rk, token, pk: pk || '' };
+    const rk = u.searchParams.get('rk');
+    const token = u.searchParams.get('token');
+    const pk = u.searchParams.get('pk') || '';
+    if (!rk || !token) throw new Error('Faltan parametros rk o token');
+    return { nit: rk, token, pk };
   } catch (e) {
-    throw new Error('URL del token inválida: ' + e.message);
+    throw new Error('URL del token invalida: ' + e.message);
   }
 }
 
-/**
- * descargarDIAN - usa Playwright para autenticarse y descargar
- * los documentos del rango de fechas indicado.
- *
- * Retorna array de { nombre, pdfBuffer, xmlBuffer, xmlText }
- */
-async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo = '' }) {
-  const { nit, token } = parseTokenUrl(tokenUrl);
-
+async function autenticar(tokenUrl) {
+  const { nit, token, pk } = parseTokenUrl(tokenUrl);
   const browser = await chromium.launch({
     headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-    ],
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu'],
   });
-
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
     acceptDownloads: true,
   });
-
   const page = await context.newPage();
-  const documentos = [];
+  console.log('[DIAN] Autenticando NIT ' + nit);
+  await page.goto(
+    'https://catalogo-vpfe.dian.gov.co/User/AuthToken?pk=' + pk + '&rk=' + nit + '&token=' + token,
+    { waitUntil: 'networkidle', timeout: 40000 }
+  );
+  const currentUrl = page.url();
+  console.log('[DIAN] URL tras auth: ' + currentUrl);
+  if (currentUrl.includes('Login') || currentUrl.includes('login')) {
+    await browser.close();
+    throw new Error('Token invalido o expirado');
+  }
+  return { browser, context, page, nit };
+}
 
+async function diagnosticarPortal(tokenUrl) {
+  const { browser, page, nit } = await autenticar(tokenUrl);
   try {
-    console.log(`[DIAN] Autenticando NIT ${nit} con token ${token.substring(0,8)}...`);
-
-    // 1. Ir al portal con el token de autenticación
     await page.goto(
-      `https://catalogo-vpfe.dian.gov.co/User/AuthToken?pk=${nit}&rk=${nit}&token=${token}`,
+      'https://catalogo-vpfe.dian.gov.co/Document/DownloadListByDate',
+      { waitUntil: 'networkidle', timeout: 30000 }
+    );
+    const info = await page.evaluate(function() {
+      return {
+        url: window.location.href,
+        titulo: document.title,
+        inputs: Array.from(document.querySelectorAll('input,select')).map(function(el) {
+          return { tag: el.tagName, id: el.id, name: el.name, type: el.type, placeholder: el.placeholder };
+        }),
+        botones: Array.from(document.querySelectorAll('button,input[type=submit]')).map(function(el) {
+          return { tag: el.tagName, id: el.id, text: el.textContent.trim().substring(0,50), cls: el.className.substring(0,60) };
+        }),
+        html: document.body.innerHTML.substring(0, 5000),
+      };
+    });
+    return { ok: true, nit: nit, info: info };
+  } finally {
+    await browser.close();
+  }
+}
+
+async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo }) {
+  const { browser, context, page, nit } = await autenticar(tokenUrl);
+  const documentos = [];
+  try {
+    await page.goto(
+      'https://catalogo-vpfe.dian.gov.co/Document/DownloadListByDate',
       { waitUntil: 'networkidle', timeout: 30000 }
     );
 
-    // 2. Verificar que la autenticación fue exitosa
-    const url = page.url();
-    if (url.includes('Login') || url.includes('Error')) {
-      throw new Error('Token inválido o expirado. Solicita un nuevo token en el portal de la DIAN.');
+    // Intentar llenar fechas con multiples selectores
+    const selectoresFecha = ['#fechaInicio','input[name="fechaInicio"]','input[type="date"]:first-of-type','input[placeholder*="nicio"]'];
+    const selectoresFechaFin = ['#fechaFin','input[name="fechaFin"]','input[type="date"]:last-of-type','input[placeholder*="in"]'];
+    for (const sel of selectoresFecha) {
+      try { await page.fill(sel, fechaInicio, { timeout: 4000 }); console.log('[OK] fecha inicio con ' + sel); break; } catch(e) {}
     }
-
-    console.log(`[DIAN] Sesión iniciada. Navegando a historial...`);
-
-    // 3. Ir a la página de descarga de listados
-    await page.goto(
-      'https://catalogo-vpfe.dian.gov.co/Document/DownloadListByDate',
-      { waitUntil: 'networkidle', timeout: 20000 }
-    );
-
-    // 4. Configurar rango de fechas
-    await page.fill('#fechaInicio', fechaInicio);
-    await page.fill('#fechaFin', fechaFin);
-
-    // Filtrar por grupo si aplica
+    for (const sel of selectoresFechaFin) {
+      try { await page.fill(sel, fechaFin, { timeout: 4000 }); console.log('[OK] fecha fin con ' + sel); break; } catch(e) {}
+    }
     if (grupo) {
-      await page.selectOption('#grupo', grupo);
-    }
-
-    // 5. Hacer clic en "Consultar"
-    await page.click('button[type="submit"], #btnConsultar, button:has-text("Consultar")');
-    await page.waitForLoadState('networkidle', { timeout: 30000 });
-
-    // 6. Obtener la lista de documentos de la tabla
-    const filas = await page.$$eval('table tbody tr', rows =>
-      rows.map(row => {
-        const celdas = Array.from(row.querySelectorAll('td'));
-        return {
-          cufe:    celdas[1]?.textContent?.trim() || '',
-          folio:   celdas[2]?.textContent?.trim() || '',
-          tipo:    celdas[0]?.textContent?.trim() || '',
-          fecha:   celdas[7]?.textContent?.trim() || '',
-          total:   celdas[29]?.textContent?.trim() || '',
-          // El link de descarga del ZIP
-          linkZip: celdas[celdas.length - 1]?.querySelector('a')?.href || '',
-        };
-      }).filter(r => r.cufe)
-    );
-
-    console.log(`[DIAN] Encontrados ${filas.length} documentos`);
-
-    // 7. Descargar cada documento (ZIP con PDF + XML)
-    for (const fila of filas) {
-      try {
-        if (!fila.linkZip) continue;
-
-        const [download] = await Promise.all([
-          page.waitForEvent('download'),
-          page.goto(fila.linkZip),
-        ]);
-
-        const buffer = await download.createReadStream().then(stream =>
-          new Promise((res, rej) => {
-            const chunks = [];
-            stream.on('data', c => chunks.push(c));
-            stream.on('end', () => res(Buffer.concat(chunks)));
-            stream.on('error', rej);
-          })
-        );
-
-        // Extraer PDF y XML del ZIP
-        const zip = await JSZip.loadAsync(buffer);
-        let pdfBuffer = null, xmlBuffer = null, xmlText = '';
-
-        for (const [fname, file] of Object.entries(zip.files)) {
-          if (fname.endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
-          if (fname.endsWith('.xml')) {
-            xmlBuffer = await file.async('nodebuffer');
-            xmlText   = await file.async('text');
-          }
-        }
-
-        documentos.push({
-          cufe:      fila.cufe,
-          folio:     fila.folio,
-          tipo:      fila.tipo,
-          fecha:     fila.fecha,
-          pdfBuffer,
-          xmlBuffer,
-          xmlText,
-          nombre:    `${fila.fecha.replace(/\//g,'-')}_${fila.folio}`,
-        });
-
-        console.log(`  ✓ ${fila.folio} descargado`);
-      } catch (err) {
-        console.error(`  ✗ Error descargando ${fila.folio}:`, err.message);
+      for (const sel of ['select','#grupo','select[name="grupo"]']) {
+        try { await page.selectOption(sel, grupo, { timeout: 3000 }); break; } catch(e) {}
       }
     }
+    for (const sel of ['button[type="submit"]','#btnConsultar','button:has-text("Consultar")','button:has-text("Buscar")']) {
+      try { await page.click(sel, { timeout: 4000 }); await page.waitForLoadState('networkidle', { timeout: 20000 }); console.log('[OK] click con ' + sel); break; } catch(e) {}
+    }
+    await page.waitForTimeout(2000);
 
-    console.log(`[DIAN] Descarga completa: ${documentos.length} documentos`);
+    // Extraer filas de la tabla
+    const filas = await page.evaluate(function() {
+      var rows = Array.from(document.querySelectorAll('table tbody tr'));
+      return rows.map(function(row) {
+        var cells = Array.from(row.querySelectorAll('td'));
+        var links = Array.from(row.querySelectorAll('a'));
+        return {
+          cells: cells.map(function(c) { return c.textContent.trim(); }),
+          links: links.map(function(a) { return a.href; }),
+        };
+      }).filter(function(r) { return r.cells.length > 2; });
+    });
+    console.log('[DIAN] Filas en tabla: ' + filas.length);
+
+    for (const fila of filas) {
+      const linkZip = fila.links.find(function(l) { return l.includes('zip') || l.includes('Zip') || l.includes('ZIP') || l.includes('Download') || l.includes('download'); });
+      if (!linkZip) continue;
+      try {
+        const [download] = await Promise.all([
+          page.waitForEvent('download', { timeout: 30000 }),
+          page.goto(linkZip),
+        ]);
+        const pathDl = await download.path();
+        const buffer = fs.readFileSync(pathDl);
+        const zip = await JSZip.loadAsync(buffer);
+        let pdfBuffer = null, xmlBuffer = null, xmlText = '';
+        for (const entry of Object.entries(zip.files)) {
+          const fname = entry[0]; const file = entry[1];
+          if (fname.toLowerCase().endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
+          if (fname.toLowerCase().endsWith('.xml')) { xmlBuffer = await file.async('nodebuffer'); xmlText = await file.async('text'); }
+        }
+        const folio = fila.cells[2] || fila.cells[1] || 'doc';
+        documentos.push({ cufe: fila.cells[1]||'', folio, tipo: fila.cells[0]||'', fecha: fila.cells[7]||fila.cells[3]||'', pdfBuffer, xmlBuffer, xmlText, nombre: folio });
+        console.log('  OK ' + folio);
+      } catch(err) { console.error('  ERR ' + err.message); }
+    }
     return { documentos, nit, total: documentos.length };
-
   } finally {
     await browser.close();
   }
 }
 
-/**
- * exportarExcelDIAN - descarga el Excel del listado tal como lo exporta la DIAN
- */
-async function exportarExcelDIAN({ tokenUrl, fechaInicio, fechaFin, grupo = '' }) {
-  const { nit, token } = parseTokenUrl(tokenUrl);
-
-  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage'] });
-  const context = await browser.newContext({ acceptDownloads: true });
-  const page = await context.newPage();
-
-  try {
-    await page.goto(`https://catalogo-vpfe.dian.gov.co/User/AuthToken?pk=${nit}&rk=${nit}&token=${token}`, { waitUntil: 'networkidle', timeout: 30000 });
-    await page.goto('https://catalogo-vpfe.dian.gov.co/Document/DownloadListByDate', { waitUntil: 'networkidle', timeout: 20000 });
-    await page.fill('#fechaInicio', fechaInicio);
-    await page.fill('#fechaFin', fechaFin);
-    if (grupo) await page.selectOption('#grupo', grupo);
-    await page.click('button[type="submit"], #btnConsultar');
-    await page.waitForLoadState('networkidle', { timeout: 30000 });
-
-    const [download] = await Promise.all([
-      page.waitForEvent('download'),
-      page.click('#btnExportarExcel, button:has-text("Exportar Excel")'),
-    ]);
-
-    const buffer = await download.createReadStream().then(stream =>
-      new Promise((res, rej) => {
-        const chunks = [];
-        stream.on('data', c => chunks.push(c));
-        stream.on('end', () => res(Buffer.concat(chunks)));
-        stream.on('error', rej);
-      })
-    );
-
-    return buffer;
-  } finally {
-    await browser.close();
-  }
-}
-
-module.exports = { descargarDIAN, exportarExcelDIAN, parseTokenUrl };
+module.exports = { descargarDIAN, diagnosticarPortal, parseTokenUrl };

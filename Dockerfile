@@ -36,8 +36,7 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install --omit=dev
-RUN npx playwright install chromium --with-deps
+RUN npm ci --only=production
 
 COPY . .
 
