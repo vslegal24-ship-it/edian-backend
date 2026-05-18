@@ -160,8 +160,13 @@ async function descargarDocumento(page, cufe) {
     const [download] = await Promise.all([
       page.waitForEvent('download', { timeout: 25000 }),
       page.evaluate(function(id) {
-        var btn = document.getElementById(id) ||
-                  document.querySelector('button[data-id="' + id + '"]');
+        var btn = document.getElementById(id);
+        if (!btn) {
+          var btns = document.querySelectorAll('button[data-id]');
+          for (var i = 0; i < btns.length; i++) {
+            if (btns[i].getAttribute('data-id') === id) { btn = btns[i]; break; }
+          }
+        }
         if (btn) { btn.click(); return true; }
         return false;
       }, cufe),
@@ -276,7 +281,12 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
       const rangoHasta = fila.rango ? fila.rango.split('/')[1] : fechaFin;
 
       const btnVisible = await page.evaluate(function(cuf) {
-        return !!document.querySelector('button[data-id="' + cuf + '"], button#' + cuf);
+        if (document.getElementById(cuf)) return true;
+        var btns = document.querySelectorAll('button[data-id]');
+        for (var i = 0; i < btns.length; i++) {
+          if (btns[i].getAttribute('data-id') === cuf) return true;
+        }
+        return false;
       }, cufe);
 
       if (!btnVisible) {
@@ -286,7 +296,12 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
         let pg = 1;
         while (pg <= 25 && !encontrado) {
           encontrado = await page.evaluate(function(cuf) {
-            return !!document.querySelector('button[data-id="' + cuf + '"], button#' + cuf);
+            if (document.getElementById(cuf)) return true;
+            var btns = document.querySelectorAll('button[data-id]');
+            for (var i = 0; i < btns.length; i++) {
+              if (btns[i].getAttribute('data-id') === cuf) return true;
+            }
+            return false;
           }, cufe);
           if (encontrado) break;
           const ok = await page.evaluate(function() {
