@@ -3,6 +3,7 @@ const router = express.Router();
 const { descargarDIAN, diagnosticarPortal, parseTokenUrl } = require('../services/dianScraper');
 const { procesarLote } = require('../services/xmlParser');
 const { generarExcelItems, generarExcelResumen } = require('../utils/excelGenerator');
+const JSZip = require('jszip');
 
 /**
  * POST /api/dian/validar-token
@@ -126,6 +127,55 @@ router.post('/diagnosticar', async (req, res) => {
     res.json(info);
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/dian/zip
+ * Genera ZIP con PDFs y XMLs renombrados: NIT_NombreEmisor_Folio_Fecha.pdf/xml
+ * + el Excel detallado adentro
+ */
+router.post('/zip', async (req, res) => {
+  const { filas, facturas_data, empresa = 'EDIAN', fechaInicio, fechaFin } = req.body;
+  if (!facturas_data || !facturas_data.length) {
+    return res.status(400).json({ error: 'Sin datos para generar ZIP' });
+  }
+  try {
+    const zip = new JSZip();
+    const folder = zip.folder('facturas');
+
+    // Agregar Excel detallado
+    const { buffer: xlsBuffer, filename: xlsFilename } = generarExcelItems(
+      filas || [], facturas_data,
+      { empresa, fechaIni: fechaInicio, fechaFin }
+    );
+    folder.file(xlsFilename, xlsBuffer);
+
+    // Agregar PDFs y XMLs con nombre: NIT_Nombre_Folio_Fecha
+    for (const fac of facturas_data) {
+      const nitEmi  = (fac.emisor && fac.emisor.nit)    || fac.nitEmisor || '';
+      const nomEmi  = (fac.emisor && fac.emisor.nombre) || fac.nomEmisor || '';
+      const folio   = (fac.folio || fac.numero || 'sin-folio').replace(/[^a-zA-Z0-9-]/g, '_');
+      const fecha   = (fac.fecha || '').replace(/[^0-9]/g, '').substring(0, 8);
+      const nomLimpio = nomEmi.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').substring(0, 20);
+      const baseName  = [nitEmi, nomLimpio, folio, fecha].filter(Boolean).join('_');
+
+      if (fac.pdfBuffer) folder.file(baseName + '.pdf', fac.pdfBuffer);
+      if (fac.xmlBuffer) folder.file(baseName + '.xml', fac.xmlBuffer);
+      else if (fac.xmlText) folder.file(baseName + '.xml', fac.xmlText);
+    }
+
+    const zipBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    const emp = empresa.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 20);
+    const fi  = (fechaInicio || '').replace(/-/g, '');
+    const ff  = (fechaFin    || '').replace(/-/g, '');
+    const zipName = emp + '_' + fi + '_' + ff + '.zip';
+
+    res.setHeader('Content-Disposition', 'attachment; filename="' + zipName + '"');
+    res.setHeader('Content-Type', 'application/zip');
+    res.send(zipBuffer);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
