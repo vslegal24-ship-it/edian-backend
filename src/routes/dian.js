@@ -5,6 +5,16 @@ const { procesarLote } = require('../services/xmlParser');
 const { generarExcelItems, generarExcelResumen } = require('../utils/excelGenerator');
 const JSZip = require('jszip');
 
+// Cache temporal de ZIPs generados (se limpian despues de 30 min)
+const zipCache = new Map();
+function limpiarCacheVieja() {
+  const ahora = Date.now();
+  for (const [key, val] of zipCache.entries()) {
+    if (ahora - val.timestamp > 30 * 60 * 1000) zipCache.delete(key);
+  }
+}
+setInterval(limpiarCacheVieja, 5 * 60 * 1000);
+
 /**
  * POST /api/dian/validar-token
  * Valida el formato del token URL antes de lanzar el proceso
@@ -53,15 +63,56 @@ router.post('/descargar', async (req, res) => {
 
     console.log(`[API] Procesados: ${facturas.length} facturas, ${filas.length} ítems`);
 
+    // Generar ZIP inmediatamente y cachearlo (los buffers solo existen aqui)
+    let zipKey = null;
+    try {
+      const zipObj = new JSZip();
+      const folder = zipObj.folder('facturas');
+
+      // Excel detallado adentro del ZIP
+      const { buffer: xlsBuf, filename: xlsName } = generarExcelItems(filas, facturas, {
+        empresa, fechaIni: fechaInicio, fechaFin,
+      });
+      folder.file(xlsName, xlsBuf);
+
+      // PDF y XML de cada documento renombrados
+      for (const doc of documentos) {
+        const nitEmi  = (doc.emisor && doc.emisor.nit)    || doc.nitEmisor || '';
+        const nomEmi  = (doc.emisor && doc.emisor.nombre) || doc.nomEmisor || '';
+        const folio   = (doc.folio || doc.numero || 'sin-folio').replace(/[^a-zA-Z0-9\-]/g, '_');
+        const fecha   = (doc.fecha || '').replace(/[^0-9]/g, '').substring(0, 8);
+        const nomL    = nomEmi.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').substring(0, 20);
+        const base    = [nitEmi, nomL, folio, fecha].filter(Boolean).join('_');
+        if (doc.pdfBuffer) folder.file(base + '.pdf', doc.pdfBuffer);
+        if (doc.xmlBuffer) folder.file(base + '.xml', doc.xmlBuffer);
+        else if (doc.xmlText) folder.file(base + '.xml', doc.xmlText);
+      }
+
+      const zipBuffer = await zipObj.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+      zipKey = Date.now() + '_' + nit;
+      const emp = empresa.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 20);
+      const fi  = (fechaInicio || '').replace(/-/g, '');
+      const ff  = (fechaFin    || '').replace(/-/g, '');
+      zipCache.set(zipKey, {
+        buffer: zipBuffer,
+        filename: emp + '_' + fi + '_' + ff + '.zip',
+        timestamp: Date.now(),
+      });
+      console.log('[ZIP] Cacheado:', zipKey, '(' + zipBuffer.length + ' bytes)');
+    } catch (zipErr) {
+      console.error('[ZIP] Error generando cache:', zipErr.message);
+    }
+
     res.json({
       ok: true,
       nit,
       total: documentos.length,
       facturas: facturas.length,
       items: filas.length,
-      filas,        // ← array plano 1 fila por ítem para la tabla
-      facturas_data: facturas, // ← cabeceras para el resumen
+      filas,
+      facturas_data: facturas,
       errores,
+      zipKey,
       periodo: { desde: fechaInicio, hasta: fechaFin },
       empresa,
     });
@@ -128,6 +179,18 @@ router.post('/diagnosticar', async (req, res) => {
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
+});
+
+/**
+ * GET /api/dian/zip/:key
+ * Sirve el ZIP cacheado generado durante la descarga
+ */
+router.get('/zip/:key', (req, res) => {
+  const cached = zipCache.get(req.params.key);
+  if (!cached) return res.status(404).json({ error: 'ZIP no encontrado o expirado. Descarga de nuevo.' });
+  res.setHeader('Content-Disposition', 'attachment; filename="' + cached.filename + '"');
+  res.setHeader('Content-Type', 'application/zip');
+  res.send(cached.buffer);
 });
 
 /**
