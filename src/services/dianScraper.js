@@ -92,66 +92,134 @@ async function buscarConFechas(page, url, startDate, endDate, startISO, endISO) 
 }
 
 /**
- * Extrae filas de la pagina actual del portal
+ * Extrae TODOS los registros usando la API de DataTables.
+ * Esto evita tener que paginar manualmente.
  */
-async function extraerFilasPagina(page) {
-  return await page.evaluate(function() {
-    var filas = [];
-    var rows = document.querySelectorAll('table tbody tr, tbody tr');
-    rows.forEach(function(tr) {
-      var cells = Array.from(tr.querySelectorAll('td')).map(function(td) {
-        return td.textContent.trim().replace(/\s+/g, ' ');
-      });
-      var btn = tr.querySelector('button.download-document, button[data-id]');
-      var cufe = btn ? (btn.getAttribute('data-id') || btn.id || '') : '';
-      if (cells.length > 2 && cufe) filas.push({ cells: cells, cufe: cufe });
-    });
+async function recolectarTodosCUFEs(page) {
+  // Esperar a que DataTables cargue
+  await page.waitForTimeout(2000);
 
-    // Info paginacion
-    var nextBtn = document.querySelector(
-      '#tbl-documents_next:not(.disabled), ' +
-      'li.paginate_button.next:not(.disabled) a, ' +
-      '.next:not(.disabled) a'
-    );
-    var totalInfo = document.querySelector('#tbl-documents_info, [id*="_info"]');
-    return {
-      filas: filas,
-      hasNext: !!nextBtn,
-      info: totalInfo ? totalInfo.textContent.trim() : '',
-    };
+  const resultado = await page.evaluate(function() {
+    var filas = [];
+
+    // Metodo 1: API de DataTables (mas confiable - obtiene todos los registros)
+    try {
+      if (window.$ && $.fn.DataTable) {
+        var tables = $('table.dataTable, table[id*="tbl"]');
+        if (tables.length > 0) {
+          var dt = tables.first().DataTable();
+          var totalRows = dt.rows().count();
+          console.log('[DT] Total registros en DataTable:', totalRows);
+
+          // Cambiar page length a ALL para ver todos
+          dt.page.len(-1).draw(false);
+
+          // Esperar redibujado no es posible en sync, usamos rows()
+          dt.rows().every(function() {
+            var node = this.node();
+            var cells = Array.from(node.querySelectorAll('td')).map(function(td) {
+              return td.textContent.trim().replace(/\s+/g, ' ');
+            });
+            var btn = node.querySelector('button.download-document, button[data-id]');
+            var cufe = btn ? (btn.getAttribute('data-id') || btn.id || '') : '';
+            if (cells.length > 2 && cufe) filas.push({ cells: cells, cufe: cufe });
+          });
+
+          if (filas.length > 0) {
+            return { filas: filas, metodo: 'datatable-api', total: totalRows };
+          }
+        }
+      }
+    } catch(e) {
+      console.log('[DT] Error API:', e.message);
+    }
+
+    // Metodo 2: Extraer de TODOS los tr incluyendo los ocultos por paginacion
+    try {
+      var allRows = document.querySelectorAll('table tbody tr');
+      allRows.forEach(function(tr) {
+        var cells = Array.from(tr.querySelectorAll('td')).map(function(td) {
+          return td.textContent.trim().replace(/\s+/g, ' ');
+        });
+        var btn = tr.querySelector('button.download-document, button[data-id]');
+        var cufe = btn ? (btn.getAttribute('data-id') || btn.id || '') : '';
+        if (cells.length > 2 && cufe) filas.push({ cells: cells, cufe: cufe });
+      });
+      return { filas: filas, metodo: 'querySelectorAll', total: filas.length };
+    } catch(e) {
+      return { filas: [], metodo: 'error', total: 0, error: e.message };
+    }
   });
+
+  console.log('[DIAN] Metodo: ' + resultado.metodo + ' | Filas: ' + resultado.filas.length + ' | Total DT: ' + resultado.total);
+
+  // Si DataTables solo dio la pagina visible, paginar manualmente como fallback
+  if (resultado.filas.length <= 10 && resultado.metodo !== 'datatable-api') {
+    console.log('[DIAN] Fallback: paginacion manual...');
+    return await recolectarPorPaginacion(page, resultado.filas);
+  }
+
+  return resultado.filas;
 }
 
 /**
- * Recolecta TODOS los CUFEs de todas las paginas del resultado actual.
- * Navega paginacion sin recargar el formulario.
+ * Fallback: navega pagina por pagina (maximo 25 paginas)
  */
-async function recolectarTodosCUFEs(page) {
-  const todos = [];
-  let pg = 1;
-  const MAX_PG = 25;
+async function recolectarPorPaginacion(page, filasIniciales) {
+  const todos = [...filasIniciales];
+  let pg = 2; // Ya tenemos pag 1
 
-  while (pg <= MAX_PG) {
-    const datos = await extraerFilasPagina(page);
-    todos.push(...datos.filas);
-    console.log('[DIAN] Pag ' + pg + ': ' + datos.filas.length + ' filas | total: ' + todos.length + ' | ' + datos.info);
-
-    if (!datos.hasNext || datos.filas.length === 0) break;
-
-    // Click siguiente
-    const clicado = await page.evaluate(function() {
-      var n = document.querySelector(
+  while (pg <= 25) {
+    // Buscar y hacer clic en el numero de pagina o "Siguiente"
+    const clicado = await page.evaluate(function(pgNum) {
+      // Intentar clic en numero de pagina especifico
+      var pageLinks = document.querySelectorAll('.paginate_button:not(.previous):not(.next):not(.first):not(.last):not(.disabled):not(.active)');
+      for (var i = 0; i < pageLinks.length; i++) {
+        if (pageLinks[i].textContent.trim() === String(pgNum)) {
+          pageLinks[i].click();
+          return 'pag-' + pgNum;
+        }
+      }
+      // Intentar "Siguiente"
+      var next = document.querySelector(
         '#tbl-documents_next:not(.disabled), ' +
-        'li.paginate_button.next:not(.disabled) a, ' +
-        '.paginate_button.next:not(.disabled)'
+        'a.paginate_button.next:not(.disabled), ' +
+        '.paginate_button.next:not(.disabled) a'
       );
-      if (n) { n.click(); return true; }
-      return false;
-    });
+      if (next) { next.click(); return 'next'; }
+      return null;
+    }, pg);
+
     if (!clicado) break;
     await page.waitForTimeout(1500);
+
+    const filasPag = await page.evaluate(function() {
+      var filas = [];
+      var rows = document.querySelectorAll('table tbody tr');
+      rows.forEach(function(tr) {
+        var cells = Array.from(tr.querySelectorAll('td')).map(function(td) {
+          return td.textContent.trim().replace(/\s+/g, ' ');
+        });
+        var btn = tr.querySelector('button.download-document, button[data-id]');
+        var cufe = btn ? (btn.getAttribute('data-id') || btn.id || '') : '';
+        if (cells.length > 2 && cufe) filas.push({ cells: cells, cufe: cufe });
+      });
+      var isLast = !document.querySelector(
+        '#tbl-documents_next:not(.disabled), .paginate_button.next:not(.disabled) a'
+      );
+      return { filas: filas, isLast: isLast };
+    });
+
+    console.log('[DIAN] Pag ' + pg + ': ' + filasPag.filas.length + ' filas');
+    // Deduplicar
+    filasPag.filas.forEach(function(f) {
+      if (!todos.find(function(x){ return x.cufe === f.cufe; })) todos.push(f);
+    });
+
+    if (filasPag.isLast || filasPag.filas.length === 0) break;
     pg++;
   }
+
   return todos;
 }
 
