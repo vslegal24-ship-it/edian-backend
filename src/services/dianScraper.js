@@ -58,26 +58,118 @@ async function descargarExcelListados(page, startDate, endDate, startISO, endISO
     }
   }, { start: startDate, end: endDate, startISO, endISO });
 
-  // Hacer click en "Exportar Excel"
-  console.log('[DIAN] Descargando Excel de listados...');
-  const [download] = await Promise.all([
-    page.waitForEvent('download', { timeout: 60000 }),
-    page.evaluate(function() {
-      var btns = Array.from(document.querySelectorAll('button, a'));
-      var b = btns.find(function(x) {
-        return (x.textContent || '').toLowerCase().includes('exportar') ||
-               (x.textContent || '').toLowerCase().includes('excel') ||
-               (x.id || '').toLowerCase().includes('excel');
-      });
-      if (b) { b.click(); return b.textContent; }
-      return null;
-    }),
-  ]);
+  // Primero hacer Consultar para cargar resultados
+  await page.evaluate(function() {
+    var btns = Array.from(document.querySelectorAll('button, input[type=submit]'));
+    var b = btns.find(function(x) {
+      var t = (x.textContent + (x.value||'')).toLowerCase();
+      return t.includes('consultar') || t.includes('buscar') || t.includes('search');
+    });
+    if (b) b.click();
+  });
+  await page.waitForTimeout(3000);
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(function(){});
+  console.log('[DIAN] Resultados cargados, buscando boton exportar...');
 
-  const pathDl = await download.path();
-  const buffer = fs.readFileSync(pathDl);
-  const nombre = download.suggestedFilename();
-  console.log('[DIAN] Excel listados descargado: ' + nombre + ' (' + buffer.length + ' bytes)');
+  // Inspeccionar botones disponibles
+  const botonesInfo = await page.evaluate(function() {
+    return Array.from(document.querySelectorAll('button, a, input[type=submit]')).map(function(el) {
+      return { tag: el.tagName, id: el.id, text: el.textContent.trim().substring(0,50), href: el.href||'', cls: el.className.substring(0,50) };
+    });
+  });
+  console.log('[DIAN] Botones disponibles:', JSON.stringify(botonesInfo.filter(function(b){ return b.text.length > 2; }).slice(0,15)));
+
+  // Intentar descargar el Excel con multiple estrategias
+  let buffer = null;
+
+  // Estrategia 1: waitForEvent download
+  try {
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: 20000 }),
+      page.evaluate(function() {
+        var btns = Array.from(document.querySelectorAll('button, a, input'));
+        var b = btns.find(function(x) {
+          var t = (x.textContent + (x.value||x.id||x.name||'')).toLowerCase();
+          return t.includes('exportar') || t.includes('excel') || t.includes('export');
+        });
+        if (b) { b.click(); return b.textContent || b.value; }
+        return null;
+      }),
+    ]);
+    const pathDl = await download.path();
+    buffer = fs.readFileSync(pathDl);
+    console.log('[DIAN] Excel via download event: ' + download.suggestedFilename() + ' (' + buffer.length + 'b)');
+  } catch(e1) {
+    console.log('[DIAN] Estrategia 1 fallo:', e1.message.substring(0,80));
+
+    // Estrategia 2: interceptar respuesta
+    try {
+      const [response] = await Promise.all([
+        page.waitForResponse(function(r) {
+          const ct = r.headers()['content-type'] || '';
+          return ct.includes('spreadsheet') || ct.includes('excel') || ct.includes('octet-stream');
+        }, { timeout: 20000 }),
+        page.evaluate(function() {
+          var btns = Array.from(document.querySelectorAll('button, a, input'));
+          var b = btns.find(function(x) {
+            var t = (x.textContent + (x.value||x.id||'')).toLowerCase();
+            return t.includes('exportar') || t.includes('excel') || t.includes('export');
+          });
+          if (b) { b.click(); return true; }
+          return false;
+        }),
+      ]);
+      buffer = await response.body();
+      console.log('[DIAN] Excel via response intercept: ' + buffer.length + 'b');
+    } catch(e2) {
+      console.log('[DIAN] Estrategia 2 fallo:', e2.message.substring(0,80));
+
+      // Estrategia 3: POST directo usando fetch con las cookies activas
+      console.log('[DIAN] Intentando POST directo al endpoint de exportacion...');
+      const excelData = await page.evaluate(async function(params) {
+        // Obtener el CSRF token
+        var csrf = '';
+        var csrfEl = document.querySelector('input[name="__RequestVerificationToken"]');
+        if (csrfEl) csrf = csrfEl.value;
+
+        // Intentar llamar directamente al endpoint de exportacion
+        var urls = [
+          '/Document/ExportExcel',
+          '/Document/DownloadListByDate/Export',
+          '/Document/DownloadListByDate/ExportExcel',
+          '/Document/ExportListByDate',
+        ];
+        for (var i = 0; i < urls.length; i++) {
+          try {
+            var body = new URLSearchParams();
+            body.append('__RequestVerificationToken', csrf);
+            body.append('StartDate', params.start);
+            body.append('EndDate', params.end);
+            var resp = await fetch(urls[i], {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+              body: body.toString(),
+              credentials: 'include',
+            });
+            if (resp.ok) {
+              var ct = resp.headers.get('content-type') || '';
+              var arr = await resp.arrayBuffer();
+              return { url: urls[i], size: arr.byteLength, ct: ct, data: Array.from(new Uint8Array(arr)) };
+            }
+          } catch(e) {}
+        }
+        return null;
+      }, { start: startDate, end: endDate });
+
+      if (excelData && excelData.size > 100) {
+        buffer = Buffer.from(excelData.data);
+        console.log('[DIAN] Excel via POST directo (' + excelData.url + '): ' + buffer.length + 'b');
+      } else {
+        throw new Error('No se pudo descargar el Excel de listados. Verifica que el rango tenga documentos.');
+      }
+    }
+  }
+
   return buffer;
 }
 
