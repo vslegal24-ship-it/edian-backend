@@ -10,9 +10,7 @@ function parseTokenUrl(url) {
     const pk = u.searchParams.get('pk') || '';
     if (!rk || !token) throw new Error('Faltan parametros rk o token');
     return { nit: rk, token, pk };
-  } catch (e) {
-    throw new Error('URL del token invalida: ' + e.message);
-  }
+  } catch(e) { throw new Error('URL del token invalida: ' + e.message); }
 }
 
 function toFechaDIAN(iso) {
@@ -20,130 +18,141 @@ function toFechaDIAN(iso) {
   return parseInt(m) + '/' + parseInt(d) + '/' + y + ' 12:00:00 AM';
 }
 
-/**
- * Extrae TODAS las filas de una pagina de resultados,
- * navegando por todas las paginas de paginacion.
- */
-async function extraerTodasLasFilas(page) {
-  let todasFilas = [];
-  let pagina = 1;
-
-  while (true) {
-    await page.waitForTimeout(1500);
-
-    // Extraer filas de la pagina actual
-    const filasPagina = await page.evaluate(function() {
-      var resultado = [];
-      var rows = document.querySelectorAll('table tbody tr, tbody tr');
-      rows.forEach(function(tr) {
-        var cells = Array.from(tr.querySelectorAll('td')).map(function(td) {
-          return td.textContent.trim().replace(/\s+/g, ' ');
-        });
-        var btn = tr.querySelector('button.download-document, button[data-id]');
-        var cufe = btn ? (btn.getAttribute('data-id') || btn.id || '') : '';
-        if (cells.length > 2 && cufe) {
-          resultado.push({ cells: cells, cufe: cufe });
-        }
-      });
-
-      // Info de paginacion
-      var info = document.querySelector('[class*="dataTables_info"], .pagination-info, #tbl-documents_info');
-      var infoText = info ? info.textContent.trim() : '';
-      var nextBtn = document.querySelector('[id*="_next"], .next:not(.disabled), li.next:not(.disabled) a');
-      var nextDisabled = nextBtn
-        ? (nextBtn.classList.contains('disabled') || nextBtn.closest('li.disabled') !== null)
-        : true;
-
-      return {
-        filas: resultado,
-        infoText: infoText,
-        hasNext: !nextDisabled && nextBtn !== null,
-        nextSelector: nextBtn ? nextBtn.tagName + (nextBtn.id ? '#'+nextBtn.id : '') : '',
-      };
-    });
-
-    console.log('[DIAN] Pag ' + pagina + ': ' + filasPagina.filas.length + ' filas | ' + filasPagina.infoText);
-    todasFilas = todasFilas.concat(filasPagina.filas);
-
-    if (!filasPagina.hasNext) {
-      console.log('[DIAN] Ultima pagina alcanzada');
-      break;
-    }
-
-    // Ir a la siguiente pagina
-    console.log('[DIAN] Siguiente pagina...');
-    try {
-      await Promise.all([
-        page.waitForResponse(function(r) {
-          return r.url().includes('/Document/') && r.status() === 200;
-        }, { timeout: 10000 }).catch(function() {}),
-        page.evaluate(function() {
-          var next = document.querySelector('[id*="_next"]:not(.disabled), li.next:not(.disabled) a, .paginate_button.next:not(.disabled)');
-          if (next) { next.click(); return true; }
-          return false;
-        }),
-      ]);
-      pagina++;
-      await page.waitForTimeout(2000);
-    } catch (e) {
-      console.log('[DIAN] Error navegando pagina:', e.message);
-      break;
-    }
-
-    // Limite de seguridad: max 20 paginas (1000 docs)
-    if (pagina > 20) {
-      console.log('[DIAN] Limite de paginas alcanzado');
-      break;
-    }
+/** Divide un rango en sub-rangos mensuales */
+function dividirEnMeses(fechaInicio, fechaFin) {
+  const rangos = [];
+  let cur = new Date(fechaInicio + 'T00:00:00');
+  const fin = new Date(fechaFin + 'T00:00:00');
+  while (cur <= fin) {
+    const ini = cur.toISOString().split('T')[0];
+    const ultimoDia = new Date(cur.getFullYear(), cur.getMonth() + 1, 0);
+    const endMes = ultimoDia <= fin ? ultimoDia.toISOString().split('T')[0] : fechaFin;
+    rangos.push({ desde: ini, hasta: endMes });
+    cur = new Date(cur.getFullYear(), cur.getMonth() + 1, 1);
   }
-
-  return todasFilas;
+  return rangos;
 }
 
 /**
- * Navega a una pagina del portal, inyecta fechas y busca.
- * Retorna todas las filas (paginadas).
+ * Recarga la pagina con fechas y extrae SOLO la primera pagina de filas.
+ * Usa form.submit() + URL params para forzar las fechas.
  */
-async function consultarPagina(page, url, startDate, endDate, startISO, endISO) {
+async function buscarConFechas(page, url, startDate, endDate, startISO, endISO) {
+  // Navegar a la pagina
   await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-  console.log('[DIAN] Pagina: ' + page.url());
 
-  // Inyectar fechas en hidden fields y daterangepicker
-  await page.evaluate(function(p) {
+  // Inyectar fechas directamente en el formulario via JS
+  const resultado = await page.evaluate(function(p) {
+    // 1. Hidden fields
     var sEl = document.getElementById('startDate');
     var eEl = document.getElementById('endDate');
     if (sEl) sEl.value = p.start;
     if (eEl) eEl.value = p.end;
 
+    // 2. DateRangePicker visible
     var rEl = document.getElementById('dashboard-report-range');
     if (rEl) {
       rEl.value = p.startISO + ' - ' + p.endISO;
+      // Disparar el Apply del daterangepicker de bootstrap
+      if (window.$ && $(rEl).data('daterangepicker')) {
+        try {
+          var dr = $(rEl).data('daterangepicker');
+          dr.setStartDate(p.startISO);
+          dr.setEndDate(p.endISO);
+          // Simular el evento apply
+          $(rEl).trigger('apply.daterangepicker', [dr]);
+        } catch(e) {}
+      }
       rEl.dispatchEvent(new Event('change', { bubbles: true }));
-      rEl.dispatchEvent(new Event('input', { bubbles: true }));
     }
-    if (window.$ && rEl) {
-      try {
-        var dr = $(rEl).data('daterangepicker');
-        if (dr) { dr.setStartDate(p.startISO); dr.setEndDate(p.endISO); }
-      } catch(e) {}
-    }
+
+    // 3. Verificar que se setearon
+    return {
+      startSet: sEl ? sEl.value : 'NO',
+      endSet: eEl ? eEl.value : 'NO',
+      rangeSet: rEl ? rEl.value : 'NO',
+    };
   }, { start: startDate, end: endDate, startISO, endISO });
+
+  console.log('[DIAN] Fechas seteadas:', JSON.stringify(resultado));
+
+  // Esperar y hacer submit via AJAX si es posible
+  await page.waitForTimeout(500);
 
   // Hacer clic en Buscar
   await page.evaluate(function() {
     var btns = Array.from(document.querySelectorAll('button, input[type=submit]'));
-    var b = btns.find(function(x) {
-      return (x.textContent + (x.value||'')).toLowerCase().includes('buscar');
-    });
+    var b = btns.find(function(x) { return (x.textContent + (x.value||'')).toLowerCase().includes('buscar'); });
     if (b) b.click();
     else { var f = document.querySelector('form'); if (f) f.submit(); }
   });
 
-  await page.waitForTimeout(4000);
-  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(function() {});
+  await page.waitForTimeout(3000);
+  await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(function(){});
+}
 
-  // Extraer TODAS las filas (todas las paginas)
-  return await extraerTodasLasFilas(page);
+/**
+ * Extrae filas de la pagina actual del portal
+ */
+async function extraerFilasPagina(page) {
+  return await page.evaluate(function() {
+    var filas = [];
+    var rows = document.querySelectorAll('table tbody tr, tbody tr');
+    rows.forEach(function(tr) {
+      var cells = Array.from(tr.querySelectorAll('td')).map(function(td) {
+        return td.textContent.trim().replace(/\s+/g, ' ');
+      });
+      var btn = tr.querySelector('button.download-document, button[data-id]');
+      var cufe = btn ? (btn.getAttribute('data-id') || btn.id || '') : '';
+      if (cells.length > 2 && cufe) filas.push({ cells: cells, cufe: cufe });
+    });
+
+    // Info paginacion
+    var nextBtn = document.querySelector(
+      '#tbl-documents_next:not(.disabled), ' +
+      'li.paginate_button.next:not(.disabled) a, ' +
+      '.next:not(.disabled) a'
+    );
+    var totalInfo = document.querySelector('#tbl-documents_info, [id*="_info"]');
+    return {
+      filas: filas,
+      hasNext: !!nextBtn,
+      info: totalInfo ? totalInfo.textContent.trim() : '',
+    };
+  });
+}
+
+/**
+ * Recolecta TODOS los CUFEs de todas las paginas del resultado actual.
+ * Navega paginacion sin recargar el formulario.
+ */
+async function recolectarTodosCUFEs(page) {
+  const todos = [];
+  let pg = 1;
+  const MAX_PG = 25;
+
+  while (pg <= MAX_PG) {
+    const datos = await extraerFilasPagina(page);
+    todos.push(...datos.filas);
+    console.log('[DIAN] Pag ' + pg + ': ' + datos.filas.length + ' filas | total: ' + todos.length + ' | ' + datos.info);
+
+    if (!datos.hasNext || datos.filas.length === 0) break;
+
+    // Click siguiente
+    const clicado = await page.evaluate(function() {
+      var n = document.querySelector(
+        '#tbl-documents_next:not(.disabled), ' +
+        'li.paginate_button.next:not(.disabled) a, ' +
+        '.paginate_button.next:not(.disabled)'
+      );
+      if (n) { n.click(); return true; }
+      return false;
+    });
+    if (!clicado) break;
+    await page.waitForTimeout(1500);
+    pg++;
+  }
+  return todos;
 }
 
 async function descargarDocumento(page, cufe) {
@@ -157,30 +166,23 @@ async function descargarDocumento(page, cufe) {
         return false;
       }, cufe),
     ]);
-
     const pathDl = await download.path();
     const buffer = fs.readFileSync(pathDl);
-    const suggestedName = download.suggestedFilename();
-    console.log('  [DL] ' + suggestedName + ' (' + buffer.length + 'b)');
-
+    const name = download.suggestedFilename();
     let pdfBuffer = null, xmlBuffer = null, xmlText = '';
     try {
       const zip = await JSZip.loadAsync(buffer);
-      for (const [fname, file] of Object.entries(zip.files)) {
-        if (fname.toLowerCase().endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
-        if (fname.toLowerCase().endsWith('.xml')) {
-          xmlBuffer = await file.async('nodebuffer');
-          xmlText = await file.async('text');
-        }
+      for (const [fn, file] of Object.entries(zip.files)) {
+        if (fn.toLowerCase().endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
+        if (fn.toLowerCase().endsWith('.xml')) { xmlBuffer = await file.async('nodebuffer'); xmlText = await file.async('text'); }
       }
-    } catch (zipErr) {
-      const ext = (suggestedName || '').toLowerCase();
-      if (ext.endsWith('.xml')) { xmlBuffer = buffer; xmlText = buffer.toString('utf8'); }
-      else if (ext.endsWith('.pdf')) pdfBuffer = buffer;
+    } catch(e) {
+      if ((name||'').toLowerCase().endsWith('.xml')) { xmlBuffer = buffer; xmlText = buffer.toString('utf8'); }
+      else if ((name||'').toLowerCase().endsWith('.pdf')) pdfBuffer = buffer;
     }
     return { pdfBuffer, xmlBuffer, xmlText };
-  } catch (err) {
-    console.error('  [ERR DL]', err.message);
+  } catch(e) {
+    console.error('  [ERR DL]', e.message);
     return null;
   }
 }
@@ -188,9 +190,16 @@ async function descargarDocumento(page, cufe) {
 async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }) {
   const { nit, token, pk } = parseTokenUrl(tokenUrl);
 
+  // Dividir en rangos mensuales si supera 31 dias
+  const ini = new Date(fechaInicio + 'T00:00:00');
+  const fin2 = new Date(fechaFin + 'T00:00:00');
+  const dias = Math.round((fin2 - ini) / 86400000);
+  const rangos = dias > 31 ? dividirEnMeses(fechaInicio, fechaFin) : [{ desde: fechaInicio, hasta: fechaFin }];
+  console.log('[DIAN] Rangos a procesar:', rangos.length, '(' + dias + ' dias)');
+
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu'],
   });
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
@@ -202,48 +211,49 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
     // Autenticar
     console.log('[DIAN] Autenticando NIT ' + nit);
     await page.goto(
-      'https://catalogo-vpfe.dian.gov.co/User/AuthToken?pk=' + pk + '&rk=' + nit + '&token=' + token,
+      'https://catalogo-vpfe.dian.gov.co/User/AuthToken?pk='+pk+'&rk='+nit+'&token='+token,
       { waitUntil: 'networkidle', timeout: 40000 }
     );
-    if (page.url().includes('login') || page.url().includes('Login')) {
-      throw new Error('Token invalido o expirado.');
+    if (page.url().includes('login') || page.url().includes('Login')) throw new Error('Token invalido o expirado.');
+
+    // FASE 1: Recolectar TODOS los CUFEs por rango y grupo
+    const todosLosCUFEs = []; // { cufe, cells, grupo }
+
+    for (const rango of rangos) {
+      console.log('[DIAN] Rango: ' + rango.desde + ' a ' + rango.hasta);
+      const startDate = toFechaDIAN(rango.desde);
+      const endDate   = toFechaDIAN(rango.hasta);
+
+      const urls = [];
+      if (grupo === 'Recibido' || !grupo) urls.push({ url: 'https://catalogo-vpfe.dian.gov.co/Document/Received', grp: 'Recibido' });
+      if (grupo === 'Emitido'  || !grupo) urls.push({ url: 'https://catalogo-vpfe.dian.gov.co/Document/Sent', grp: 'Emitido' });
+
+      for (const destino of urls) {
+        await buscarConFechas(page, destino.url, startDate, endDate, rango.desde, rango.hasta);
+        const filas = await recolectarTodosCUFEs(page);
+        filas.forEach(function(f) { f.grupo = destino.grp; f.rango = rango.desde + '/' + rango.hasta; });
+        // Deduplicar por CUFE
+        filas.forEach(function(f) {
+          if (!todosLosCUFEs.find(function(x){ return x.cufe === f.cufe; })) {
+            todosLosCUFEs.push(f);
+          }
+        });
+        console.log('[DIAN] ' + destino.grp + ' ' + rango.desde + ': ' + filas.length + ' | Total acum: ' + todosLosCUFEs.length);
+      }
     }
 
-    const startDate = toFechaDIAN(fechaInicio);
-    const endDate   = toFechaDIAN(fechaFin);
-    console.log('[DIAN] Periodo: ' + fechaInicio + ' a ' + fechaFin);
+    console.log('[DIAN] TOTAL CUFEs recolectados: ' + todosLosCUFEs.length);
 
-    // Consultar segun grupo
-    let todasFilas = [];
-
-    if (grupo === 'Emitido') {
-      const f = await consultarPagina(page, 'https://catalogo-vpfe.dian.gov.co/Document/Sent', startDate, endDate, fechaInicio, fechaFin);
-      f.forEach(function(r) { r.grupo = 'Emitido'; });
-      todasFilas = f;
-    } else if (grupo === 'Recibido') {
-      const f = await consultarPagina(page, 'https://catalogo-vpfe.dian.gov.co/Document/Received', startDate, endDate, fechaInicio, fechaFin);
-      f.forEach(function(r) { r.grupo = 'Recibido'; });
-      todasFilas = f;
-    } else {
-      // Todos: recibidos + emitidos
-      const fRec = await consultarPagina(page, 'https://catalogo-vpfe.dian.gov.co/Document/Received', startDate, endDate, fechaInicio, fechaFin);
-      fRec.forEach(function(r) { r.grupo = 'Recibido'; });
-
-      const fEmi = await consultarPagina(page, 'https://catalogo-vpfe.dian.gov.co/Document/Sent', startDate, endDate, fechaInicio, fechaFin);
-      fEmi.forEach(function(r) { r.grupo = 'Emitido'; });
-
-      todasFilas = fRec.concat(fEmi);
-    }
-
-    console.log('[DIAN] TOTAL filas todas las paginas: ' + todasFilas.length);
-
-    // Descargar documentos
+    // FASE 2: Descargar documentos
     const documentos = [];
-    for (let i = 0; i < todasFilas.length; i++) {
-      const fila = todasFilas[i];
+    let lastUrl = '';
+
+    for (let i = 0; i < todosLosCUFEs.length; i++) {
+      const fila = todosLosCUFEs[i];
       const cufe  = fila.cufe;
       const cells = fila.cells;
       const grp   = fila.grupo;
+      const [desde, hasta] = (fila.rango || fechaInicio + '/' + fechaFin).split('/').slice(0, 2).concat([fechaFin]);
 
       const fecha   = cells[2] || cells[1] || '';
       const prefijo = cells[3] || '';
@@ -253,63 +263,55 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
       const nomEmi  = cells[7] || '';
       const nitRec  = cells[8] || nit;
       const nomRec  = cells[9] || '';
-      const nombre  = (prefijo ? prefijo + '-' : '') + folio;
+      const nombre  = (prefijo ? prefijo+'-' : '') + folio;
 
-      console.log('[DIAN] (' + (i+1) + '/' + todasFilas.length + ') ' + nombre);
+      console.log('[DIAN] DL (' + (i+1) + '/' + todosLosCUFEs.length + ') ' + nombre);
 
-      // Volver a la pagina correcta si es necesario
-      const paginaDestino = grp === 'Emitido'
+      // Si el boton no esta visible, recargar la pagina con las fechas del rango
+      const paginaUrl = grp === 'Emitido'
         ? 'https://catalogo-vpfe.dian.gov.co/Document/Sent'
         : 'https://catalogo-vpfe.dian.gov.co/Document/Received';
 
-      if (!page.url().includes(grp === 'Emitido' ? 'Sent' : 'Received')) {
-        await consultarPagina(page, paginaDestino, startDate, endDate, fechaInicio, fechaFin);
-      }
+      const rangoDesde = fila.rango ? fila.rango.split('/')[0] : fechaInicio;
+      const rangoHasta = fila.rango ? fila.rango.split('/')[1] : fechaFin;
 
-      // Buscar el boton en la pagina actual
-      const btnEnPagina = await page.evaluate(function(cuf) {
-        return !!document.querySelector('button[data-id="' + cuf + '"], #' + cuf);
+      const btnVisible = await page.evaluate(function(cuf) {
+        return !!document.querySelector('button[data-id="' + cuf + '"], button#' + cuf);
       }, cufe);
 
-      if (!btnEnPagina) {
-        // Necesita navegar a la pagina correcta del resultado
-        console.log('  Boton no visible, buscando en paginacion...');
-        // Buscar en todas las paginas de resultados
-        let found = false;
+      if (!btnVisible) {
+        await buscarConFechas(page, paginaUrl, toFechaDIAN(rangoDesde), toFechaDIAN(rangoHasta), rangoDesde, rangoHasta);
+        // Navegar hasta la pagina que tiene el boton
+        let encontrado = false;
         let pg = 1;
-        while (pg <= 20 && !found) {
-          const en = await page.evaluate(function(cuf) {
+        while (pg <= 25 && !encontrado) {
+          encontrado = await page.evaluate(function(cuf) {
             return !!document.querySelector('button[data-id="' + cuf + '"], button#' + cuf);
           }, cufe);
-          if (en) { found = true; break; }
-          // Ir a siguiente pagina
-          const hasNext2 = await page.evaluate(function() {
-            var n = document.querySelector('[id*="_next"]:not(.disabled), li.next:not(.disabled) a');
-            if (n) { n.click(); return true; }
-            return false;
+          if (encontrado) break;
+          const ok = await page.evaluate(function() {
+            var n = document.querySelector('#tbl-documents_next:not(.disabled), li.paginate_button.next:not(.disabled) a');
+            if (n) { n.click(); return true; } return false;
           });
-          if (!hasNext2) break;
-          await page.waitForTimeout(1500);
+          if (!ok) break;
+          await page.waitForTimeout(1000);
           pg++;
         }
       }
 
       const archivos = await descargarDocumento(page, cufe);
-
       documentos.push({
-        cufe,
-        cufeUrl: 'https://catalogo-vpfe.dian.gov.co/document/searchqr?documentkey=' + cufe,
+        cufe, cufeUrl: 'https://catalogo-vpfe.dian.gov.co/document/searchqr?documentkey='+cufe,
         folio: nombre, nombre, tipo, fecha, grupo: grp,
-        nitEmisor: nitEmi, nomEmisor: nomEmi,
-        nitReceptor: nitRec, nomReceptor: nomRec,
-        pdfBuffer: archivos ? archivos.pdfBuffer : null,
-        xmlBuffer: archivos ? archivos.xmlBuffer : null,
-        xmlText:   archivos ? archivos.xmlText   : '',
+        nitEmisor: nitEmi, nomEmisor: nomEmi, nitReceptor: nitRec, nomReceptor: nomRec,
+        pdfBuffer: archivos?.pdfBuffer || null,
+        xmlBuffer: archivos?.xmlBuffer || null,
+        xmlText:   archivos?.xmlText   || '',
       });
     }
 
-    console.log('[DIAN] Descargados: ' + documentos.length + ' de ' + todasFilas.length);
-    return { documentos, nit, total: documentos.length, filasEncontradas: todasFilas.length };
+    console.log('[DIAN] Descargados: ' + documentos.length);
+    return { documentos, nit, total: documentos.length, filasEncontradas: todosLosCUFEs.length };
 
   } finally {
     await browser.close();
