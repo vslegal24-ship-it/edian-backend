@@ -293,6 +293,117 @@ async function paginarManual(page, filasIniciales) {
   return todos;
 }
 
+/**
+ * Encuentra el patron de URL de descarga interceptando el primer click.
+ * Retorna la funcion de descarga que usa fetch directo.
+ */
+async function encontrarUrlDescarga(page, primerCufe) {
+  let downloadUrl = null;
+  let downloadMethod = null;
+  let downloadBody = null;
+
+  // Interceptar requests para encontrar el patron
+  const handler = function(req) {
+    const u = req.url();
+    const m = req.method();
+    if (u.includes('Download') || u.includes('download') || u.includes('GetFile') || u.includes('getfile') || u.includes('Zip') || u.includes('zip')) {
+      if (u.includes('dian.gov.co') || u.includes('catalogo')) {
+        downloadUrl = u;
+        downloadMethod = m;
+        downloadBody = req.postData();
+        console.log('[INTERCEPT DL] ' + m + ' ' + u + (downloadBody ? ' body:'+downloadBody.substring(0,100) : ''));
+      }
+    }
+  };
+  page.on('request', handler);
+
+  // Hacer el primer click para capturar la URL
+  try {
+    await Promise.all([
+      page.waitForEvent('download', { timeout: 20000 }),
+      page.evaluate(function(id) {
+        var el = document.getElementById(id);
+        if (!el) {
+          var btns = document.querySelectorAll('button[data-id]');
+          for (var i = 0; i < btns.length; i++) {
+            if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; }
+          }
+        }
+        if (el) { el.click(); return true; }
+        return false;
+      }, primerCufe),
+    ]);
+  } catch(e) {
+    console.log('[INTERCEPT DL] Error en primer click:', e.message.substring(0,80));
+  }
+  page.off('request', handler);
+
+  if (downloadUrl) {
+    console.log('[DIAN] URL de descarga encontrada: ' + downloadMethod + ' ' + downloadUrl);
+    return { url: downloadUrl, method: downloadMethod, bodyTemplate: downloadBody };
+  }
+  return null;
+}
+
+/**
+ * Descarga un documento usando fetch directo con la URL conocida.
+ */
+async function descargarViaUrl(page, cufe, urlInfo) {
+  try {
+    // Construir la URL con el CUFE del documento
+    let url = urlInfo.url;
+    let body = urlInfo.bodyTemplate;
+
+    // Reemplazar el CUFE del primer documento con el actual
+    if (body) {
+      // Reemplazar el valor del CUFE en el body
+      body = body.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
+      body = body.replace(/id=[^&]+/, 'id=' + encodeURIComponent(cufe));
+      body = body.replace(/documentKey=[^&]+/, 'documentKey=' + encodeURIComponent(cufe));
+    }
+    if (urlInfo.method === 'GET') {
+      // Reemplazar en la URL
+      url = url.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
+      url = url.replace(/\/[a-f0-9]{40,}/, '/' + cufe);
+    }
+
+    const resultado = await page.evaluate(async function(params) {
+      try {
+        var resp;
+        if (params.method === 'GET') {
+          resp = await fetch(params.url, { credentials: 'include' });
+        } else {
+          resp = await fetch(params.url, {
+            method: params.method || 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+            body: params.body,
+            credentials: 'include',
+          });
+        }
+        if (!resp.ok) return { error: 'HTTP ' + resp.status };
+        var arr = await resp.arrayBuffer();
+        return { size: arr.byteLength, data: Array.from(new Uint8Array(arr)) };
+      } catch(e) { return { error: e.message }; }
+    }, { url, method: urlInfo.method, body });
+
+    if (resultado.error || !resultado.size) return null;
+    const buffer = Buffer.from(resultado.data);
+    let pdfBuffer = null, xmlBuffer = null, xmlText = '';
+    const JSZip2 = require('jszip');
+    try {
+      const zip = await JSZip2.loadAsync(buffer);
+      for (const [fn, file] of Object.entries(zip.files)) {
+        if (fn.toLowerCase().endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
+        if (fn.toLowerCase().endsWith('.xml')) { xmlBuffer = await file.async('nodebuffer'); xmlText = await file.async('text'); }
+      }
+    } catch(e) {}
+    return { pdfBuffer, xmlBuffer, xmlText };
+  } catch(e) {
+    console.error('[DL URL]', e.message.substring(0,80));
+    return null;
+  }
+}
+
 async function descargarDocumentoClick(page, cufe) {
   try {
     const [download] = await Promise.all([
@@ -445,10 +556,49 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
       let totalPaginas = Math.ceil(g.docs.length / 10);
       let totalDescargadosGrupo = 0;
 
-      // Para cada pagina del DataTables:
-      // 1. Recargar con fechas (garantiza estado limpio)
-      // 2. Navegar a la pagina correcta
-      // 3. Descargar todos los botones visibles
+      // Cargar pagina, click primer boton para descubrir URL, luego usar URL directa
+      await buscarYNavegar(page, pUrl, startD, endD, g.desde, g.hasta);
+
+      // Obtener primer CUFE visible para descubrir la URL de descarga
+      const primerosCUFEs = await page.evaluate(function() {
+        var cufes = [];
+        document.querySelectorAll('button.download-document, button[data-id]').forEach(function(btn) {
+          var c = btn.getAttribute('data-id') || btn.id;
+          if (c && c.length > 20) cufes.push(c);
+        });
+        return cufes;
+      });
+
+      let urlDescargaInfo = null;
+      const primerCufeDescargable = primerosCUFEs.find(function(c){ return cufeMap[c] && !descargadosCUFE[c]; });
+
+      if (primerCufeDescargable) {
+        console.log('[DIAN] Descubriendo URL de descarga con ' + cufeMap[primerCufeDescargable].nombre + '...');
+        urlDescargaInfo = await encontrarUrlDescarga(page, primerCufeDescargable);
+        // Marcar como descargado (ya lo bajamos en el proceso de descubrir)
+        const doc = cufeMap[primerCufeDescargable];
+        // Re-descargar via click normal para obtener el buffer
+        const archivos = await descargarDocumentoClick(page, primerCufeDescargable);
+        descargadosCUFE[primerCufeDescargable] = true;
+        totalDescargadosGrupo++;
+        documentos.push({ ...doc, pdfBuffer: archivos?.pdfBuffer||null, xmlBuffer: archivos?.xmlBuffer||null, xmlText: archivos?.xmlText||'' });
+      }
+
+      // Si tenemos URL de descarga, usarla directamente para TODOS los demas
+      if (urlDescargaInfo) {
+        console.log('[DIAN] Usando descarga directa para ' + (g.docs.length - 1) + ' documentos restantes');
+        for (const doc of g.docs) {
+          if (descargadosCUFE[doc.cufe]) continue;
+          console.log('  [DL URL] ' + doc.nombre);
+          const archivos = await descargarViaUrl(page, doc.cufe, urlDescargaInfo);
+          descargadosCUFE[doc.cufe] = true;
+          totalDescargadosGrupo++;
+          documentos.push({ ...doc, pdfBuffer: archivos?.pdfBuffer||null, xmlBuffer: archivos?.xmlBuffer||null, xmlText: archivos?.xmlText||'' });
+        }
+        console.log('[DIAN] Grupo ' + g.grp + ' (URL directa): ' + totalDescargadosGrupo + '/' + g.docs.length);
+      } else {
+        console.log('[DIAN] URL no encontrada, usando paginacion...');
+      // Fallback: paginacion
       for (let pg = 1; pg <= totalPaginas + 2; pg++) {
         // Siempre recargar con fechas antes de cada pagina
         // Esto evita que los AJAX de las descargas reseteen el filtro
@@ -523,7 +673,8 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
         console.log('[DIAN] Pag ' + pg + ': +' + descargadosEnPagina + ' | total: ' + totalDescargadosGrupo + '/' + g.docs.length);
         if (totalDescargadosGrupo >= g.docs.length) break;
         if (descargadosEnPagina === 0) break;
-      }
+      } // end for pg
+      } // end if !urlDescargaInfo
 
       console.log('[DIAN] Grupo ' + g.grp + ': ' + totalDescargadosGrupo + '/' + g.docs.length);
     }
