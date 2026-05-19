@@ -42,8 +42,10 @@ router.get('/ping', (req, res) => {
 // ── POST /api/auth/login ─────────────────────────────────────
 router.post('/login', async (req, res) => {
   try {
+    console.log('[AUTH] Body recibido:', JSON.stringify(req.body));
+    console.log('[AUTH] Content-Type:', req.headers['content-type']);
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email y contraseña requeridos' });
+    if (!email || !password) return res.status(400).json({ error: 'Email y contrasena requeridos', body: req.body });
 
     const usuario = await getUsuario(email);
     if (!usuario) {
