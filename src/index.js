@@ -2,8 +2,10 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 
-const dianRoutes = require('./routes/dian');
+const dianRoutes  = require('./routes/dian');
 const fase2Routes = require('./routes/fase2');
+const authRoutes  = require('./routes/auth');
+const boldRoutes  = require('./routes/bold');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -11,7 +13,7 @@ const PORT = process.env.PORT || 3001;
 // ── Middleware ──────────────────────────────────────────────
 app.use(cors({
   origin: process.env.FRONTEND_URL || '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 app.use(express.json({ limit: '50mb' }));
@@ -32,8 +34,10 @@ app.get('/health', (req, res) => {
 });
 
 // ── Rutas ───────────────────────────────────────────────────
-app.use('/api/dian', dianRoutes);
+app.use('/api/dian',  dianRoutes);
 app.use('/api/fase2', fase2Routes);
+app.use('/api/auth',  authRoutes);
+app.use('/api/bold',  boldRoutes);
 
 // ── Error handler ───────────────────────────────────────────
 app.use((err, req, res, next) => {
