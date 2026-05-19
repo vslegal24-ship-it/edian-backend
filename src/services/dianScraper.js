@@ -408,12 +408,11 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
 
     console.log('[DIAN] TOTAL CUFEs: ' + todosDocumentos.length);
 
-    // FASE 2: Descargar por grupo+rango, página por página del DataTables
-    // Esto evita tener que buscar botones individuales en el DOM
+    // FASE 2: Descargar por grupo+rango, recargando la pagina para cada pagina de DataTables
     const documentos = [];
     const descargadosCUFE = {};
 
-    // Agrupar por grupo+rango para minimizar recargas de página
+    // Agrupar por grupo+rango
     const grupos = {};
     todosDocumentos.forEach(function(doc) {
       const key = doc.grupo + '|' + doc.rangoDesde + '|' + doc.rangoHasta;
@@ -423,43 +422,88 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
 
     for (const gKey of Object.keys(grupos)) {
       const g = grupos[gKey];
-      const pUrl = g.grp === 'Emitido' ? 'https://catalogo-vpfe.dian.gov.co/Document/Sent' : 'https://catalogo-vpfe.dian.gov.co/Document/Received';
+      const pUrl = g.grp === 'Emitido'
+        ? 'https://catalogo-vpfe.dian.gov.co/Document/Sent'
+        : 'https://catalogo-vpfe.dian.gov.co/Document/Received';
       console.log('[DIAN] Descargando grupo ' + g.grp + ' ' + g.desde + ': ' + g.docs.length + ' docs');
 
-      // Cargar la página con las fechas del rango
-      await buscarYNavegar(page, pUrl, toFechaDIAN(g.desde), toFechaDIAN(g.hasta), g.desde, g.hasta);
-
-      // Crear mapa CUFE → doc para lookup rápido
       const cufeMap = {};
       g.docs.forEach(function(d) { cufeMap[d.cufe] = d; });
 
-      // Navegar página por página y descargar todos los botones visibles
-      let pg = 1;
+      const startD = toFechaDIAN(g.desde);
+      const endD   = toFechaDIAN(g.hasta);
+
+      // Para cada pagina de DataTables, recargamos la pagina y navegamos a esa pagina
+      // Esto evita que el estado se pierda despues de cada descarga
+      let paginaActual = 1;
+      let totalPaginas = Math.ceil(g.docs.length / 10);
       let totalDescargadosGrupo = 0;
 
-      while (true) {
-        // Obtener todos los CUFEs visibles en la página actual
+      for (let pg = 1; pg <= totalPaginas + 2; pg++) {
+        // Recargar la pagina con fechas para tener estado limpio
+        await buscarYNavegar(page, pUrl, startD, endD, g.desde, g.hasta);
+
+        // Navegar hasta la pagina correcta (pg) del DataTables
+        if (pg > 1) {
+          let navOk = false;
+          for (let salto = 1; salto < pg; salto++) {
+            navOk = await page.evaluate(function() {
+              var n = document.querySelector(
+                '#tbl-documents_next:not(.disabled), ' +
+                'li.paginate_button.next:not(.disabled) a, ' +
+                '.paginate_button.next:not(.disabled)'
+              );
+              if (n) { n.click(); return true; }
+              return false;
+            });
+            if (!navOk) break;
+            await page.waitForTimeout(1200);
+          }
+          if (!navOk && pg > 1) {
+            console.log('[DIAN] No hay pagina ' + pg + ', terminando grupo');
+            break;
+          }
+        }
+
+        // Obtener CUFEs visibles en esta pagina
         const cufesVisibles = await page.evaluate(function() {
           var cufes = [];
-          var btns = document.querySelectorAll('button.download-document, button[data-id]');
-          btns.forEach(function(btn) {
+          document.querySelectorAll('button.download-document, button[data-id]').forEach(function(btn) {
             var cufe = btn.getAttribute('data-id') || btn.id;
             if (cufe && cufe.length > 20) cufes.push(cufe);
           });
           return cufes;
         });
 
-        console.log('[DIAN] Pag ' + pg + ': ' + cufesVisibles.length + ' botones visibles');
+        console.log('[DIAN] Pag ' + pg + '/' + totalPaginas + ': ' + cufesVisibles.length + ' botones');
 
-        // Descargar uno por uno los que pertenecen a nuestro grupo
+        if (cufesVisibles.length === 0) {
+          console.log('[DIAN] Sin botones en pag ' + pg + ', terminando grupo');
+          break;
+        }
+
+        // Descargar los que pertenecen a este grupo y no se han descargado
+        let descargadosEnPagina = 0;
         for (const cufe of cufesVisibles) {
           if (!cufeMap[cufe] || descargadosCUFE[cufe]) continue;
-
           const doc = cufeMap[cufe];
-          console.log('  [DL] ' + doc.nombre + ' (' + doc.grupo + ')');
+          console.log('  [DL] ' + doc.nombre);
+
+          // Recargar la pagina y navegar antes de cada descarga para estado limpio
+          if (descargadosEnPagina > 0) {
+            await buscarYNavegar(page, pUrl, startD, endD, g.desde, g.hasta);
+            for (let s = 1; s < pg; s++) {
+              await page.evaluate(function() {
+                var n = document.querySelector('#tbl-documents_next:not(.disabled), li.paginate_button.next:not(.disabled) a, .paginate_button.next:not(.disabled)');
+                if (n) n.click();
+              });
+              await page.waitForTimeout(1000);
+            }
+          }
 
           const archivos = await descargarDocumentoClick(page, cufe);
           descargadosCUFE[cufe] = true;
+          descargadosEnPagina++;
           totalDescargadosGrupo++;
 
           documentos.push({
@@ -470,36 +514,16 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
           });
         }
 
-        // Ver si hay más páginas
-        const hayNext = await page.evaluate(function() {
-          var n = document.querySelector(
-            '#tbl-documents_next:not(.disabled), ' +
-            'li.paginate_button.next:not(.disabled) a, ' +
-            '.paginate_button.next:not(.disabled)'
-          );
-          return !!n;
-        });
-
-        if (!hayNext) break;
-
-        // Ir a la siguiente página
-        await page.evaluate(function() {
-          var n = document.querySelector(
-            '#tbl-documents_next:not(.disabled), ' +
-            'li.paginate_button.next:not(.disabled) a, ' +
-            '.paginate_button.next:not(.disabled)'
-          );
-          if (n) n.click();
-        });
-        await page.waitForTimeout(1500);
-        pg++;
-        if (pg > 30) break;
+        // Si no descargamos nada nuevo en esta pagina, terminamos
+        if (descargadosEnPagina === 0 && pg > 1) break;
+        // Si ya descargamos todos, terminamos
+        if (totalDescargadosGrupo >= g.docs.length) break;
       }
 
-      console.log('[DIAN] Grupo ' + g.grp + ': descargados ' + totalDescargadosGrupo + ' de ' + g.docs.length);
+      console.log('[DIAN] Grupo ' + g.grp + ': ' + totalDescargadosGrupo + '/' + g.docs.length);
     }
 
-    // Agregar los que no se pudieron descargar (sin archivos)
+    // Incluir los sin descarga
     todosDocumentos.forEach(function(doc) {
       if (!descargadosCUFE[doc.cufe]) {
         console.log('[DIAN] Sin descarga: ' + doc.nombre);
@@ -507,7 +531,7 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
       }
     });
 
-    console.log('[DIAN] Completado: ' + documentos.length + ' de ' + todosDocumentos.length);
+    console.log('[DIAN] Completado: ' + documentos.length + '/' + todosDocumentos.length);
     return { documentos, nit, total: documentos.length, filasEncontradas: todosDocumentos.length };
 
   } finally {
