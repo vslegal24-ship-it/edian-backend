@@ -30,6 +30,15 @@ async function contarConsultasHoy(userId) {
   return count || 0;
 }
 
+// ── GET /api/auth/ping (diagnóstico) ────────────────────────
+router.get('/ping', (req, res) => {
+  res.json({ ok: true, msg: 'auth router funcionando', env: {
+    supabase: !!process.env.SUPABASE_URL,
+    jwt: !!process.env.JWT_SECRET,
+    serviceKey: !!process.env.SUPABASE_SERVICE_KEY,
+  }});
+});
+
 // ── POST /api/auth/login ─────────────────────────────────────
 router.post('/login', async (req, res) => {
   try {
@@ -37,11 +46,19 @@ router.post('/login', async (req, res) => {
     if (!email || !password) return res.status(400).json({ error: 'Email y contraseña requeridos' });
 
     const usuario = await getUsuario(email);
-    if (!usuario) return res.status(401).json({ error: 'Usuario no encontrado' });
-    if (!usuario.activo) return res.status(403).json({ error: 'Cuenta inactiva. Verifica tu pago o contacta soporte.' });
+    if (!usuario) {
+      console.log('[AUTH] Usuario no encontrado:', email);
+      return res.status(401).json({ error: 'Usuario no encontrado' });
+    }
+    if (!usuario.activo) {
+      console.log('[AUTH] Usuario inactivo:', email);
+      return res.status(403).json({ error: 'Cuenta inactiva' });
+    }
 
     // Verificar contraseña
+    console.log('[AUTH] Comparando password para:', email, '| hash:', usuario.password_hash.substring(0,10));
     const ok = await bcrypt.compare(password, usuario.password_hash);
+    console.log('[AUTH] Password match:', ok);
     if (!ok) return res.status(401).json({ error: 'Contraseña incorrecta' });
 
     // Verificar vencimiento
