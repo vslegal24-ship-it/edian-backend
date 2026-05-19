@@ -173,12 +173,16 @@ async function procesarLote(xmlTexts) {
   const errores  = [];
 
   for (const { xmlText, nombre } of xmlTexts) {
+    if (!xmlText || xmlText.trim().length < 100) {
+      console.log('[Parser] Sin XML: ' + nombre);
+      continue;
+    }
     try {
       const fac = await parseXmlDIAN(xmlText);
       facturas.push(fac);
     } catch (err) {
       errores.push({ nombre, error: err.message });
-      console.error(`[Parser] Error en ${nombre}:`, err.message);
+      console.error('[Parser] Error en ' + nombre + ':', err.message);
     }
   }
 
