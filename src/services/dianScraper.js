@@ -439,33 +439,32 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
       let totalPaginas = Math.ceil(g.docs.length / 10);
       let totalDescargadosGrupo = 0;
 
+      // Para cada pagina del DataTables:
+      // 1. Recargar con fechas (garantiza estado limpio)
+      // 2. Navegar a la pagina correcta
+      // 3. Descargar todos los botones visibles
       for (let pg = 1; pg <= totalPaginas + 2; pg++) {
-        // Recargar la pagina con fechas para tener estado limpio
+        // Siempre recargar con fechas antes de cada pagina
+        // Esto evita que los AJAX de las descargas reseteen el filtro
         await buscarYNavegar(page, pUrl, startD, endD, g.desde, g.hasta);
 
-        // Navegar hasta la pagina correcta (pg) del DataTables
-        if (pg > 1) {
-          let navOk = false;
-          for (let salto = 1; salto < pg; salto++) {
-            navOk = await page.evaluate(function() {
-              var n = document.querySelector(
-                '#tbl-documents_next:not(.disabled), ' +
-                'li.paginate_button.next:not(.disabled) a, ' +
-                '.paginate_button.next:not(.disabled)'
-              );
-              if (n) { n.click(); return true; }
-              return false;
-            });
-            if (!navOk) break;
-            await page.waitForTimeout(1200);
-          }
-          if (!navOk && pg > 1) {
-            console.log('[DIAN] No hay pagina ' + pg + ', terminando grupo');
-            break;
-          }
+        // Navegar a la pagina correcta del DataTables
+        for (let salto = 1; salto < pg; salto++) {
+          const ok = await page.evaluate(function() {
+            var n = document.querySelector(
+              '#tbl-documents_next:not(.disabled), ' +
+              'li.paginate_button.next:not(.disabled) a, ' +
+              '.paginate_button.next:not(.disabled)'
+            );
+            if (n) { n.click(); return true; }
+            return false;
+          });
+          if (!ok) { pg = 9999; break; } // No hay mas paginas
+          await page.waitForTimeout(1200);
         }
+        if (pg > totalPaginas + 2) break;
 
-        // Obtener CUFEs visibles en esta pagina
+        // Obtener CUFEs visibles
         const cufesVisibles = await page.evaluate(function() {
           var cufes = [];
           document.querySelectorAll('button.download-document, button[data-id]').forEach(function(btn) {
@@ -476,36 +475,18 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
         });
 
         console.log('[DIAN] Pag ' + pg + '/' + totalPaginas + ': ' + cufesVisibles.length + ' botones');
+        if (cufesVisibles.length === 0) break;
 
-        if (cufesVisibles.length === 0) {
-          console.log('[DIAN] Sin botones en pag ' + pg + ', terminando grupo');
-          break;
-        }
-
-        // Descargar los que pertenecen a este grupo y no se han descargado
+        // Descargar todos sin recargar entre ellos
         let descargadosEnPagina = 0;
         for (const cufe of cufesVisibles) {
           if (!cufeMap[cufe] || descargadosCUFE[cufe]) continue;
           const doc = cufeMap[cufe];
           console.log('  [DL] ' + doc.nombre);
-
-          // Recargar la pagina y navegar antes de cada descarga para estado limpio
-          if (descargadosEnPagina > 0) {
-            await buscarYNavegar(page, pUrl, startD, endD, g.desde, g.hasta);
-            for (let s = 1; s < pg; s++) {
-              await page.evaluate(function() {
-                var n = document.querySelector('#tbl-documents_next:not(.disabled), li.paginate_button.next:not(.disabled) a, .paginate_button.next:not(.disabled)');
-                if (n) n.click();
-              });
-              await page.waitForTimeout(1000);
-            }
-          }
-
           const archivos = await descargarDocumentoClick(page, cufe);
           descargadosCUFE[cufe] = true;
           descargadosEnPagina++;
           totalDescargadosGrupo++;
-
           documentos.push({
             ...doc,
             pdfBuffer: archivos?.pdfBuffer || null,
@@ -513,11 +494,9 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
             xmlText:   archivos?.xmlText   || '',
           });
         }
-
-        // Si no descargamos nada nuevo en esta pagina, terminamos
-        if (descargadosEnPagina === 0 && pg > 1) break;
-        // Si ya descargamos todos, terminamos
+        console.log('[DIAN] Pag ' + pg + ': +' + descargadosEnPagina + ' | total: ' + totalDescargadosGrupo + '/' + g.docs.length);
         if (totalDescargadosGrupo >= g.docs.length) break;
+        if (descargadosEnPagina === 0) break;
       }
 
       console.log('[DIAN] Grupo ' + g.grp + ': ' + totalDescargadosGrupo + '/' + g.docs.length);
