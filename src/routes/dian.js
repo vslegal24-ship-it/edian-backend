@@ -58,7 +58,7 @@ router.post('/descargar', async (req, res) => {
     }
 
     // 2. Parsear todos los XMLs
-    const xmlTexts = documentos.map(d => ({ xmlText: d.xmlText, nombre: d.nombre }));
+    const xmlTexts = documentos.map(d => ({ xmlText: d.xmlText, nombre: d.nombre || d.folio || '', grupo: d.grupo || '' }));
     const { facturas, filas, errores } = await procesarLote(xmlTexts);
 
     console.log(`[API] Procesados: ${facturas.length} facturas, ${filas.length} ítems`);
