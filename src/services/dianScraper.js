@@ -159,30 +159,41 @@ async function obtenerCUFEsViaAjax(page, url, startDate, endDate, startISO, endI
  * Los campos pueden venir en diferentes formatos.
  */
 function parsearFilasAjax(rows) {
+  // Log first row to see all available fields
+  if (rows.length > 0) console.log('[AJAX] Campos disponibles:', Object.keys(rows[0]).join(', '));
+
   const resultado = [];
   rows.forEach(function(r) {
-    // Intentar extraer el CUFE del campo correspondiente
-    const cufe = r.cufe || r.Cufe || r.CUFE || r.documentKey || r.DocumentKey || r.uuid || r.UUID || '';
+    // El CUFE viene en el campo "Id" segun la DIAN
+    const cufe = r.Id || r.id || r.cufe || r.Cufe || r.CUFE || r.documentKey || r.DocumentKey || r.uuid || r.UUID || '';
     if (!cufe || cufe.length < 20) return;
+
+    // Extraer todos los campos disponibles
+    // Campos DIAN conocidos del JSON: Id, FechaEmision, FechaRecepcion, Prefijo, NumeroDocumento,
+    // TipoDocumento, NitEmisor, NombreEmisor, NitReceptor, NombreReceptor, Total, Estado
+    const folio   = r.NumeroDocumento || r.Folio || r.folio || r.numero || '';
+    const prefijo = r.Prefijo || r.prefijo || '';
+    const fecha   = r.FechaEmision || r.FechaRecepcion || r.fecha || r.Fecha || '';
+    const tipo    = r.TipoDocumento || r.tipoDocumento || r.type || 'Factura electronica';
+    const nitEmi  = r.NitEmisor || r.nitEmisor || r.SenderCode || r.senderCode || '';
+    const nomEmi  = r.NombreEmisor || r.nombreEmisor || r.SenderName || r.senderName || '';
+    const nitRec  = r.NitReceptor || r.nitReceptor || r.ReceiverCode || r.receiverCode || '';
+    const nomRec  = r.NombreReceptor || r.nombreReceptor || r.ReceiverName || r.receiverName || '';
+    const total   = r.Total || r.total || 0;
+    const estado  = r.Estado || r.estado || '';
+    const nombre  = (prefijo ? prefijo + '-' : '') + folio;
+
     resultado.push({
       cufe: String(cufe),
-      cells: [
-        r.tipoDocumento || r.TipoDocumento || r.type || '',
-        String(cufe),
-        r.folio || r.Folio || r.numero || r.Numero || '',
-        r.prefijo || r.Prefijo || '',
-        '',
-        '',
-        '',
-        r.fechaEmision || r.FechaEmision || r.fecha || r.Fecha || '',
-        '',
-        r.nitEmisor || r.NitEmisor || r.senderCode || r.SenderCode || '',
-        r.nombreEmisor || r.NombreEmisor || r.senderName || r.SenderName || '',
-        r.nitReceptor || r.NitReceptor || r.receiverCode || '',
-        r.nombreReceptor || r.NombreReceptor || r.receiverName || '',
-      ]
+      cells: [tipo, String(cufe), folio, prefijo, '', '', '', fecha, '', nitEmi, nomEmi, nitRec, nomRec],
+      // Campos adicionales ya parseados
+      tipo, fecha, prefijo, folio, nombre,
+      nitEmisor: nitEmi, nomEmisor: nomEmi,
+      nitReceptor: nitRec, nomReceptor: nomRec,
+      total, estado,
     });
   });
+  console.log('[AJAX] CUFEs parseados: ' + resultado.length + ' de ' + rows.length);
   return resultado;
 }
 
@@ -371,18 +382,21 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
           if (!seenCUFEs[f.cufe]) {
             seenCUFEs[f.cufe] = true;
             const cells = f.cells || [];
+            // Usar campos pre-parseados si existen (vienen de parsearFilasAjax)
             todosDocumentos.push({
               cufe: f.cufe,
               cufeUrl: 'https://catalogo-vpfe.dian.gov.co/document/searchqr?documentkey=' + f.cufe,
-              tipo:        cells[0] || cells[5] || 'Factura electronica',
-              fecha:       cells[7] || cells[2] || cells[1] || '',
-              prefijo:     cells[3] || '',
-              folio:       cells[4] || cells[2] || '',
-              nitEmisor:   cells[6] || cells[9] || '',
-              nomEmisor:   cells[7] || cells[10] || '',
-              nitReceptor: cells[8] || cells[11] || nit,
-              nomReceptor: cells[9] || cells[12] || '',
-              nombre:      ((cells[3]||'') ? (cells[3]+'-') : '') + (cells[4]||cells[2]||''),
+              tipo:        f.tipo        || cells[0] || 'Factura electronica',
+              fecha:       f.fecha       || cells[7] || cells[2] || '',
+              prefijo:     f.prefijo     || cells[3] || '',
+              folio:       f.folio       || cells[4] || cells[2] || '',
+              nitEmisor:   f.nitEmisor   || cells[9] || '',
+              nomEmisor:   f.nomEmisor   || cells[10] || '',
+              nitReceptor: f.nitReceptor || cells[11] || nit,
+              nomReceptor: f.nomReceptor || cells[12] || '',
+              nombre:      f.nombre      || ((cells[3]||'') ? (cells[3]+'-') : '') + (cells[4]||cells[2]||''),
+              total:       f.total       || 0,
+              estado:      f.estado      || '',
               grupo: dest.grp,
               rangoDesde: rango.desde, rangoHasta: rango.hasta,
             });
