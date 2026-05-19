@@ -347,6 +347,12 @@ async function buscarYNavegar(page, url, startDate, endDate, startISO, endISO) {
   });
   await page.waitForTimeout(3000);
   await page.waitForLoadState('networkidle',{timeout:10000}).catch(function(){});
+  // Esperar a que el DataTables termine de cargar los resultados
+  await page.waitForFunction(function() {
+    var btns = document.querySelectorAll('button.download-document, button[data-id]');
+    return btns.length > 0;
+  }, { timeout: 10000 }).catch(function() {});
+  await page.waitForTimeout(500);
 }
 
 // ── FUNCION PRINCIPAL ──────────────────────────────────────────
@@ -450,6 +456,16 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
 
         // Navegar a la pagina correcta del DataTables
         for (let salto = 1; salto < pg; salto++) {
+          // Esperar que el boton Next este disponible
+          await page.waitForFunction(function() {
+            var n = document.querySelector(
+              '#tbl-documents_next:not(.disabled), ' +
+              'li.paginate_button.next:not(.disabled) a, ' +
+              '.paginate_button.next:not(.disabled)'
+            );
+            return !!n;
+          }, { timeout: 8000 }).catch(function(){});
+
           const ok = await page.evaluate(function() {
             var n = document.querySelector(
               '#tbl-documents_next:not(.disabled), ' +
@@ -457,10 +473,20 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
               '.paginate_button.next:not(.disabled)'
             );
             if (n) { n.click(); return true; }
+            // Debug: show what pagination buttons exist
+            var allPag = Array.from(document.querySelectorAll('.paginate_button, [id*="next"]')).map(function(el){
+              return el.id + '/' + el.className.substring(0,40);
+            });
+            console.log('Paginacion disponible:', allPag.join(' | '));
             return false;
           });
-          if (!ok) { pg = 9999; break; } // No hay mas paginas
-          await page.waitForTimeout(1200);
+          if (!ok) { pg = 9999; break; }
+          // Esperar que los nuevos botones carguen
+          await page.waitForTimeout(500);
+          await page.waitForFunction(function() {
+            return document.querySelectorAll('button.download-document, button[data-id]').length > 0;
+          }, { timeout: 8000 }).catch(function(){});
+          await page.waitForTimeout(500);
         }
         if (pg > totalPaginas + 2) break;
 
