@@ -172,13 +172,14 @@ async function procesarLote(xmlTexts) {
   const facturas = [];
   const errores  = [];
 
-  for (const { xmlText, nombre } of xmlTexts) {
+  for (const { xmlText, nombre, grupo } of xmlTexts) {
     if (!xmlText || xmlText.trim().length < 100) {
       console.log('[Parser] Sin XML: ' + nombre);
       continue;
     }
     try {
       const fac = await parseXmlDIAN(xmlText);
+      fac.grupo = grupo || '';
       facturas.push(fac);
     } catch (err) {
       errores.push({ nombre, error: err.message });
@@ -192,6 +193,7 @@ async function procesarLote(xmlTexts) {
     for (const item of fac.items) {
       filas.push({
         folio: fac.folio, fecha: fac.fecha, tipo: fac.tipo,
+        grupo: fac.grupo || '',
         nitEmisor: fac.emisor.nit, nomEmisor: fac.emisor.nombre,
         nitReceptor: fac.receptor.nit, nomReceptor: fac.receptor.nombre,
         item: item.id, codigo: item.codigo, descripcion: item.descripcion,
