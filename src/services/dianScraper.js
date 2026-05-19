@@ -356,15 +356,19 @@ async function descargarViaUrl(page, cufe, urlInfo) {
 
     // Reemplazar el CUFE del primer documento con el actual
     if (body) {
-      // Reemplazar el valor del CUFE en el body
+      body = body.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
       body = body.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
       body = body.replace(/id=[^&]+/, 'id=' + encodeURIComponent(cufe));
       body = body.replace(/documentKey=[^&]+/, 'documentKey=' + encodeURIComponent(cufe));
+      body = body.replace(/[0-9a-f]{64,}/, cufe);
     }
     if (urlInfo.method === 'GET') {
-      // Reemplazar en la URL
+      // Reemplazar el trackId u otro parametro que contenga el CUFE
+      url = url.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
       url = url.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
-      url = url.replace(/\/[a-f0-9]{40,}/, '/' + cufe);
+      url = url.replace(/id=[^&]+/, 'id=' + encodeURIComponent(cufe));
+      // Reemplazar CUFE en el path si aplica
+      url = url.replace(/[0-9a-f]{64,}/, cufe);
     }
 
     const resultado = await page.evaluate(async function(params) {
