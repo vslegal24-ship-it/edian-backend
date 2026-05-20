@@ -81,17 +81,19 @@ async function parseXmlDIAN(xmlText) {
       '22':'22','CE':'22','11':'11','21':'21','41':'41','42':'42','50':'50'};
     if (mapa[schemeName]) return mapa[schemeName];
 
-    // Estrategia 2: inferir por número de dígitos del NIT
+    // Estrategia 2: inferir por patrón del número
     const n = String(nit || '').replace(/[^0-9]/g, '');
-    // NITs colombianos: 8 o 9 dígitos, empiezan por 8 o 9
-    if (n.length === 9 && (n[0]==='8'||n[0]==='9')) return '31';
-    if (n.length === 8 && (n.startsWith('80')||n.startsWith('81')||
-        n.startsWith('89')||n.startsWith('90')||n.startsWith('91'))) return '31';
-    // Cédulas: 7 o 10 dígitos
-    if (n.length === 10 || n.length === 7) return '13';
-    // Por defecto 9 dígitos = NIT
-    if (n.length === 9) return '31';
-    return '31';
+    // NITs colombianos SIEMPRE empiezan con 8 o 9 y tienen 9 dígitos
+    // Prefijos: 800, 801, 802, 811, 812, 813, 819, 820, 823, 826, 830,
+    //           832, 860, 890, 891, 892, 900, 901, 902, etc.
+    if (n.length === 9 && (n[0] === '8' || n[0] === '9')) return '31';
+    // Cédulas: 7, 8 o 10 dígitos (NO empiezan con 8 o 9 con 9 dígitos)
+    if (n.length === 10) return '13';  // CC moderna
+    if (n.length === 7 || n.length === 8) return '13';  // CC antigua
+    if (n.length === 6) return '13';   // CC muy antigua
+    // 9 dígitos que NO empiezan con 8 o 9 = cédula (ej: 1000000000)
+    if (n.length === 9 && n[0] !== '8' && n[0] !== '9') return '13';
+    return '31'; // default
   };
 
   const supCompanyEl = sup?.PartyTaxScheme?.CompanyID || sup?.PartyIdentification?.ID;
