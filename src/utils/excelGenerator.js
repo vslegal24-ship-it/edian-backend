@@ -58,56 +58,92 @@ function generarExcelItems(filas, facturas, { empresa = 'EDIAN', fechaIni, fecha
     {wch:14},{wch:14},{wch:16},{wch:50},
   ];
   ws1['!autofilter'] = { ref: 'A1:Y1' };
+  // Negrita encabezado ítems
+  const r1 = XLSX.utils.decode_range(ws1['!ref']||'A1:Y1');
+  for(let c=r1.s.c;c<=r1.e.c;c++){const cl=ws1[XLSX.utils.encode_cell({r:0,c})];if(cl)cl.s={font:{bold:true}};}
   XLSX.utils.book_append_sheet(wb, ws1, 'Ítems por factura');
 
-  // ── Pestaña 2: Terceros ────────────────────────────────────
+  // ── Pestaña 2: Terceros (23 columnas) ─────────────────────
   const tercerosMap = {};
   facturas.forEach(function(fac) {
-    const addT = function(p, tipo) {
+    const addT = function(p, tipoTercero, fuente) {
       if (!p) return;
       const nitRaw = String(p.nit||'').replace(/[^0-9]/g,'');
       if (!nitRaw || tercerosMap[nitRaw]) return;
+      const tipoId = p.tipoId || (nitRaw.length===9?'31':'13');
+      const esEmpresa = tipoId === '31';
+      const nom = (p.nombre||'').toUpperCase();
+      // Separar apellidos/nombres para personas naturales (CC)
+      // Formato típico: "APELLIDO1 APELLIDO2 NOMBRE1 NOMBRE2"
+      const partes = nom.split(' ').filter(Boolean);
       tercerosMap[nitRaw] = {
-        tipoId:   p.tipoId || (nitRaw.length===9?'31':'13'),
-        nit:      nitRaw,
-        dv:       calcDV(nitRaw),
-        nombre:   p.nombre||'',
-        actEco:   p.actEco||'',
-        tipo:     tipo,
-        regimen:  p.regimen||'',
-        dir:      p.dir||'',
-        ciudad:   p.ciudad||'',
-        codMun:   p.codMun||'',
-        depto:    p.depto||'',
-        codDepto: p.codDepto||'',
-        pais:     p.pais||'CO',
-        tel:      p.tel||'',
-        email:    p.email||'',
+        tipoId,
+        nit:       nitRaw,
+        dv:        calcDV(nitRaw),
+        razon:     esEmpresa ? nom : '',
+        ap1:       !esEmpresa && partes[0] ? partes[0] : '',
+        ap2:       !esEmpresa && partes[1] ? partes[1] : '',
+        nom1:      !esEmpresa && partes[2] ? partes[2] : '',
+        nom2:      !esEmpresa && partes[3] ? partes[3] : '',
+        dir:       (p.dir||'').toUpperCase(),
+        codDepto:  p.codDepto||'',
+        codMun:    p.codMun||'',
+        pais:      (p.pais||'CO').toUpperCase(),
+        actEco:    p.actEco||'',
+        regimen:   (p.regimen||'').toUpperCase(),
+        depto:     (p.depto||'').toUpperCase(),
+        ciudad:    (p.ciudad||'').toUpperCase(),
+        tel:       p.tel||'',
+        email:     (p.email||'').toLowerCase(),
+        respTrib:  esEmpresa ? 'RESPONSABLE' : 'NO RESPONSABLE',
+        fuente:    fuente.toUpperCase(),
+        tipoContrib: esEmpresa ? 'PERSONA JURIDICA' : 'PERSONA NATURAL',
+        tipoTercero: tipoTercero.toUpperCase(),
+        paisReside: (p.pais||'COLOMBIA').toUpperCase(),
       };
     };
-    addT(fac.emisor, 'Proveedor');
-    addT(fac.receptor, 'Cliente');
+    addT(fac.emisor,   'PROVEEDOR', fac.folio||'');
+    addT(fac.receptor, 'CLIENTE',   fac.folio||'');
   });
+
   const H2 = [
-    'Tipo ID','Código','Número ID','DV','Razón Social / Nombre',
-    'Actividad Económica','Tipo Tercero','Régimen IVA',
-    'Dirección','Ciudad','Código Municipio','Departamento',
-    'Código Departamento','País','Teléfono','Email',
+    'TIPO ID', 'NUMERO ID', 'DV', 'RAZON SOCIAL',
+    'PRIMER APELLIDO', 'SEGUNDO APELLIDO', 'PRIMER NOMBRE', 'SEGUNDO NOMBRE',
+    'DIRECCION', 'CODIGO DEPARTAMENTO', 'CODIGO MUNICIPIO', 'PAIS RESIDENCIA',
+    'ACTIVIDAD ECONOMICA', 'REGIMEN IVA', 'DEPARTAMENTO', 'CIUDAD',
+    'TELEFONO', 'EMAIL', 'RESP TRIBUTARIA', 'FUENTE',
+    'TIPO CONTRIBUYENTE', 'TIPO TERCERO', 'PAIS',
   ];
+
   const rows2 = Object.values(tercerosMap).map(function(t) {
     return [
-      TIPO_ID_NOMBRE[t.tipoId]||t.tipoId, t.tipoId,
-      t.nit, t.dv, t.nombre, t.actEco, t.tipo, t.regimen,
-      t.dir, t.ciudad, t.codMun, t.depto, t.codDepto, t.pais, t.tel, t.email,
+      t.tipoId, t.nit, t.dv, t.razon,
+      t.ap1, t.ap2, t.nom1, t.nom2,
+      t.dir, t.codDepto, t.codMun, t.pais,
+      t.actEco, t.regimen, t.depto, t.ciudad,
+      t.tel, t.email, t.respTrib, t.fuente,
+      t.tipoContrib, t.tipoTercero, t.paisReside,
     ];
   });
+
   const ws2 = XLSX.utils.aoa_to_sheet([H2, ...rows2]);
+
+  // Negrita en encabezado
+  const rango2 = XLSX.utils.decode_range(ws2['!ref'] || 'A1:W1');
+  for (let c = rango2.s.c; c <= rango2.e.c; c++) {
+    const cell = ws2[XLSX.utils.encode_cell({r:0, c})];
+    if (cell) { cell.s = { font: { bold: true }, alignment: { horizontal: 'center' } }; }
+  }
+
   ws2['!cols'] = [
-    {wch:22},{wch:4},{wch:14},{wch:4},{wch:40},
-    {wch:8},{wch:10},{wch:14},
-    {wch:35},{wch:20},{wch:8},{wch:20},{wch:6},{wch:5},{wch:14},{wch:30},
+    {wch:6},{wch:14},{wch:4},{wch:40},
+    {wch:18},{wch:18},{wch:16},{wch:16},
+    {wch:35},{wch:8},{wch:8},{wch:12},
+    {wch:8},{wch:14},{wch:20},{wch:20},
+    {wch:14},{wch:30},{wch:14},{wch:20},
+    {wch:16},{wch:12},{wch:12},
   ];
-  ws2['!autofilter'] = { ref: 'A1:P1' };
+  ws2['!autofilter'] = { ref: 'A1:W1' };
   XLSX.utils.book_append_sheet(wb, ws2, 'Terceros');
 
   // ── Pestaña 3: Resumen por factura ─────────────────────────
@@ -149,6 +185,9 @@ function generarExcelItems(filas, facturas, { empresa = 'EDIAN', fechaIni, fecha
     {wch:12},{wch:12},{wch:10},{wch:10},{wch:14},{wch:10},{wch:50},
   ];
   ws3['!autofilter'] = { ref: 'A1:O1' };
+  // Negrita encabezado resumen
+  const r3 = XLSX.utils.decode_range(ws3['!ref']||'A1:O1');
+  for(let c=r3.s.c;c<=r3.e.c;c++){const cl=ws3[XLSX.utils.encode_cell({r:0,c})];if(cl)cl.s={font:{bold:true}};}
   XLSX.utils.book_append_sheet(wb, ws3, 'Resumen por factura');
 
   // Nombre del archivo
