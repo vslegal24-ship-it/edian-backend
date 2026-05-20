@@ -53,7 +53,7 @@ async function autenticar(context, page, pk, nit, token) {
  * repetimos con length=10000 para traer todos los registros.
  */
 async function obtenerCUFEsViaAjax(page, url, startDate, endDate, startISO, endISO) {
-  await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   console.log('[DIAN] Pagina cargada: ' + page.url());
 
   // Inyectar fechas
@@ -111,7 +111,7 @@ async function obtenerCUFEsViaAjax(page, url, startDate, endDate, startISO, endI
     else { var f = document.querySelector('form'); if (f) f.submit(); }
   });
 
-  await page.waitForTimeout(4000);
+  await page.waitForTimeout(200);
   await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(function(){});
 
   console.log('[DIAN] AJAX URL interceptada:', ajaxUrl);
@@ -270,7 +270,7 @@ async function paginarManual(page, filasIniciales) {
     }, pg);
 
     if (!clicado) break;
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(300);
 
     const nuevas = await page.evaluate(function(seen) {
       var filas = [];
@@ -445,7 +445,7 @@ async function descargarDocumentoClick(page, cufe) {
 }
 
 async function buscarYNavegar(page, url, startDate, endDate, startISO, endISO) {
-  await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.evaluate(function(p) {
     var sEl = document.getElementById('startDate'); if (sEl) sEl.value = p.start;
     var eEl = document.getElementById('endDate');   if (eEl) eEl.value = p.end;
@@ -460,14 +460,14 @@ async function buscarYNavegar(page, url, startDate, endDate, startISO, endISO) {
     var b = Array.from(document.querySelectorAll('button,input[type=submit]')).find(function(x){ return (x.textContent+(x.value||'')).toLowerCase().includes('buscar'); });
     if (b) b.click(); else { var f=document.querySelector('form'); if(f) f.submit(); }
   });
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(600);
   await page.waitForLoadState('networkidle',{timeout:10000}).catch(function(){});
   // Esperar a que el DataTables termine de cargar los resultados
   await page.waitForFunction(function() {
     var btns = document.querySelectorAll('button.download-document, button[data-id]');
     return btns.length > 0;
   }, { timeout: 10000 }).catch(function() {});
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(150);
 }
 
 // ── FUNCION PRINCIPAL ──────────────────────────────────────────
@@ -494,8 +494,10 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
       console.log('[DIAN] === Rango: ' + rango.desde + ' a ' + rango.hasta + ' ===');
 
       const urls = [];
-      if (!grupo || grupo === 'Recibido') urls.push({ url: 'https://catalogo-vpfe.dian.gov.co/Document/Received', grp: 'Recibido' });
-      if (!grupo || grupo === 'Emitido')  urls.push({ url: 'https://catalogo-vpfe.dian.gov.co/Document/Sent',     grp: 'Emitido' });
+      if (!grupo || grupo === 'Recibido')       urls.push({ url: 'https://catalogo-vpfe.dian.gov.co/Document/Received',       grp: 'Recibido' });
+      if (!grupo || grupo === 'Emitido')         urls.push({ url: 'https://catalogo-vpfe.dian.gov.co/Document/Sent',           grp: 'Emitido' });
+      if (!grupo || grupo === 'NominaEmitida')   urls.push({ url: 'https://catalogo-vpfe.dian.gov.co/NominaDocument/Emitted',  grp: 'NominaEmitida' });
+      if (!grupo || grupo === 'NominaRecibida')  urls.push({ url: 'https://catalogo-vpfe.dian.gov.co/NominaDocument/Received', grp: 'NominaRecibida' });
 
       for (const dest of urls) {
         const filas = await obtenerCUFEsViaAjax(page, dest.url, startDate, endDate, rango.desde, rango.hasta);
@@ -543,10 +545,13 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
 
     for (const gKey of Object.keys(grupos)) {
       const g = grupos[gKey];
-      const pUrl = g.grp === 'Emitido'
-        ? 'https://catalogo-vpfe.dian.gov.co/Document/Sent'
-        : 'https://catalogo-vpfe.dian.gov.co/Document/Received';
+      const pUrl = g.grp === 'Emitido'        ? 'https://catalogo-vpfe.dian.gov.co/Document/Sent' :
+                   g.grp === 'NominaEmitida'  ? 'https://catalogo-vpfe.dian.gov.co/NominaDocument/Emitted' :
+                   g.grp === 'NominaRecibida' ? 'https://catalogo-vpfe.dian.gov.co/NominaDocument/Received' :
+                   'https://catalogo-vpfe.dian.gov.co/Document/Received';
       console.log('[DIAN] Descargando grupo ' + g.grp + ' ' + g.desde + ': ' + g.docs.length + ' docs');
+      global._edianTotal = (global._edianTotal || 0) + g.docs.length;
+      if (!global._edianDescargados) global._edianDescargados = 0;
 
       const cufeMap = {};
       g.docs.forEach(function(d) { cufeMap[d.cufe] = d; });
@@ -574,7 +579,9 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
       });
 
       let urlDescargaInfo = null;
+      console.log('[DIAN] primerosCUFEs visibles: ' + primerosCUFEs.length + ' en pagina ' + pUrl);
       const primerCufeDescargable = primerosCUFEs.find(function(c){ return cufeMap[c] && !descargadosCUFE[c]; });
+      console.log('[DIAN] primerCufeDescargable: ' + (primerCufeDescargable ? primerCufeDescargable.substring(0,20) : 'NINGUNO'));
 
       if (primerCufeDescargable) {
         console.log('[DIAN] Descubriendo URL de descarga con ' + cufeMap[primerCufeDescargable].nombre + '...');
@@ -586,6 +593,8 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
         descargadosCUFE[primerCufeDescargable] = true;
         totalDescargadosGrupo++;
         documentos.push({ ...doc, pdfBuffer: archivos?.pdfBuffer||null, xmlBuffer: archivos?.xmlBuffer||null, xmlText: archivos?.xmlText||'' });
+        global._edianDescargados = (global._edianDescargados||0) + 1;
+        console.log('[PROGRESS] ' + global._edianDescargados + '/' + (global._edianTotal||'?'));
       }
 
       // Si tenemos URL de descarga, usarla directamente para TODOS los demas
@@ -636,11 +645,11 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
           });
           if (!ok) { pg = 9999; break; }
           // Esperar que los nuevos botones carguen
-          await page.waitForTimeout(500);
+          await page.waitForTimeout(150);
           await page.waitForFunction(function() {
             return document.querySelectorAll('button.download-document, button[data-id]').length > 0;
           }, { timeout: 8000 }).catch(function(){});
-          await page.waitForTimeout(500);
+          await page.waitForTimeout(150);
         }
         if (pg > totalPaginas + 2) break;
 
@@ -706,7 +715,7 @@ async function diagnosticarPortal(tokenUrl) {
   const page = await context.newPage();
   try {
     await autenticar(context, page, pk, nit, token);
-    await page.goto('https://catalogo-vpfe.dian.gov.co/Document/Received', { waitUntil: 'networkidle', timeout: 30000 });
+    await page.goto('https://catalogo-vpfe.dian.gov.co/Document/Received', { waitUntil: 'domcontentloaded', timeout: 30000 });
     const info = await page.evaluate(function() {
       return { url: window.location.href, titulo: document.title,
         inputs: Array.from(document.querySelectorAll('input,select')).map(function(el) {
