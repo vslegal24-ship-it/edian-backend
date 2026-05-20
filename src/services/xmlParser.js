@@ -58,28 +58,73 @@ async function parseXmlDIAN(xmlText) {
 
   // ── Emisor ────────────────────────────────────────────────
   const sup = root.AccountingSupplierParty?.Party || {};
+  // Función para extraer atributos (schemeID, schemeName) de elementos xml2js
+  const getAttr = (obj, ...keys) => {
+    let cur = obj;
+    for (const k of keys) { if (!cur) return {}; cur = cur[k]; }
+    return (cur && cur.$) ? cur.$ : {};
+  };
+
+  // Determina tipo de identificación según schemeName
+  const tipoIdCodigo = (schemeName, nit) => {
+    const s = String(schemeName || '').trim();
+    if (s === '31' || s === 'NIT') return '31';
+    if (s === '13' || s === 'CC')  return '13';
+    if (s === '22' || s === 'CE')  return '22';
+    if (s === '11')                return '11'; // Registro civil
+    if (s === '12')                return '12'; // Tarjeta identidad
+    if (s === '21')                return '21'; // Tarjeta extranjería
+    if (s === '41')                return '41'; // Pasaporte
+    if (s === '42')                return '42'; // Doc identificación extranjero
+    if (s === '50')                return '50'; // NIT otro país
+    // Inferir por longitud si no tiene schemeName
+    const n = String(nit || '').replace(/[^0-9]/g, '');
+    if (n.length === 9) return '31'; // NIT colombiano
+    if (n.length === 10 || n.length === 7 || n.length === 8) return '13'; // CC
+    return '31';
+  };
+
+  const supCompanyEl = sup?.PartyTaxScheme?.CompanyID || sup?.PartyIdentification?.ID;
+  const supAttrs = (supCompanyEl && supCompanyEl.$) ? supCompanyEl.$ : {};
+  const emisorNit = get(sup, 'PartyTaxScheme', 'CompanyID') || get(sup, 'PartyIdentification', 'ID');
+
   const emisor = {
-    nit:    get(sup, 'PartyTaxScheme', 'CompanyID') || get(sup, 'PartyIdentification', 'ID'),
-    nombre: get(sup, 'PartyTaxScheme', 'RegistrationName') || get(sup, 'PartyName', 'Name'),
-    dir:    get(sup, 'PhysicalLocation', 'Address', 'AddressLine', 'Line'),
-    ciudad: get(sup, 'PhysicalLocation', 'Address', 'CityName'),
-    depto:  get(sup, 'PhysicalLocation', 'Address', 'CountrySubentity'),
-    tel:    get(sup, 'Contact', 'Telephone'),
-    email:  get(sup, 'Contact', 'ElectronicMail'),
-    regimen: get(sup, 'PartyTaxScheme', 'TaxLevelCode'),
-    actEco: get(sup, 'IndustryClassificationCode'),
+    nit:      emisorNit,
+    tipoId:   tipoIdCodigo(supAttrs.schemeName || supAttrs.schemeID, emisorNit),
+    nombre:   get(sup, 'PartyTaxScheme', 'RegistrationName') || get(sup, 'PartyName', 'Name'),
+    dir:      get(sup, 'PhysicalLocation', 'Address', 'AddressLine', 'Line'),
+    ciudad:   get(sup, 'PhysicalLocation', 'Address', 'CityName'),
+    codMun:   get(sup, 'PhysicalLocation', 'Address', 'PostalZone') ||
+              get(sup, 'PhysicalLocation', 'Address', 'ID'),
+    depto:    get(sup, 'PhysicalLocation', 'Address', 'CountrySubentity'),
+    codDepto: get(sup, 'PhysicalLocation', 'Address', 'CountrySubentityCode'),
+    pais:     get(sup, 'PhysicalLocation', 'Address', 'Country', 'IdentificationCode') || 'CO',
+    tel:      get(sup, 'Contact', 'Telephone'),
+    email:    get(sup, 'Contact', 'ElectronicMail'),
+    regimen:  get(sup, 'PartyTaxScheme', 'TaxLevelCode'),
+    actEco:   get(sup, 'IndustryClassificationCode'),
   };
 
   // ── Receptor ──────────────────────────────────────────────
   const cus = root.AccountingCustomerParty?.Party || {};
+  const cusCompanyEl = cus?.PartyTaxScheme?.CompanyID || cus?.PartyIdentification?.ID;
+  const cusAttrs = (cusCompanyEl && cusCompanyEl.$) ? cusCompanyEl.$ : {};
+  const receptorNit = get(cus, 'PartyTaxScheme', 'CompanyID') || get(cus, 'PartyIdentification', 'ID');
+
   const receptor = {
-    nit:    get(cus, 'PartyTaxScheme', 'CompanyID') || get(cus, 'PartyIdentification', 'ID'),
-    nombre: get(cus, 'PartyTaxScheme', 'RegistrationName') || get(cus, 'PartyName', 'Name'),
-    dir:    get(cus, 'PhysicalLocation', 'Address', 'AddressLine', 'Line'),
-    ciudad: get(cus, 'PhysicalLocation', 'Address', 'CityName'),
-    depto:  get(cus, 'PhysicalLocation', 'Address', 'CountrySubentity'),
-    tel:    get(cus, 'Contact', 'Telephone'),
-    email:  get(cus, 'Contact', 'ElectronicMail'),
+    nit:      receptorNit,
+    tipoId:   tipoIdCodigo(cusAttrs.schemeName || cusAttrs.schemeID, receptorNit),
+    nombre:   get(cus, 'PartyTaxScheme', 'RegistrationName') || get(cus, 'PartyName', 'Name'),
+    dir:      get(cus, 'PhysicalLocation', 'Address', 'AddressLine', 'Line'),
+    ciudad:   get(cus, 'PhysicalLocation', 'Address', 'CityName'),
+    codMun:   get(cus, 'PhysicalLocation', 'Address', 'PostalZone') ||
+              get(cus, 'PhysicalLocation', 'Address', 'ID'),
+    depto:    get(cus, 'PhysicalLocation', 'Address', 'CountrySubentity'),
+    codDepto: get(cus, 'PhysicalLocation', 'Address', 'CountrySubentityCode'),
+    pais:     get(cus, 'PhysicalLocation', 'Address', 'Country', 'IdentificationCode') || 'CO',
+    tel:      get(cus, 'Contact', 'Telephone'),
+    email:    get(cus, 'Contact', 'ElectronicMail'),
+    actEco:   get(cus, 'IndustryClassificationCode'),
   };
 
   // ── Totales ───────────────────────────────────────────────
