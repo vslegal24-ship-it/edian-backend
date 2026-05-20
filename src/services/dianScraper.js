@@ -471,7 +471,7 @@ async function buscarYNavegar(page, url, startDate, endDate, startISO, endISO) {
 }
 
 // ── FUNCION PRINCIPAL ──────────────────────────────────────────
-async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }) {
+async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa, soloXML = false }) {
   const { nit, token, pk } = parseTokenUrl(tokenUrl);
   const dias = Math.round((new Date(fechaFin+'T00:00:00') - new Date(fechaInicio+'T00:00:00')) / 86400000);
   const rangos = dias > 31 ? dividirEnMeses(fechaInicio, fechaFin) : [{ desde: fechaInicio, hasta: fechaFin }];
@@ -599,7 +599,19 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
 
       // Si tenemos URL de descarga, usarla directamente para TODOS los demas
       if (urlDescargaInfo) {
-        console.log('[DIAN] Usando descarga directa para ' + (g.docs.length - 1) + ' documentos restantes');
+        const restantes = g.docs.filter(function(d){ return !descargadosCUFE[d.cufe]; });
+        console.log('[DIAN] ' + (soloXML ? 'MODO RÁPIDO XML' : 'descarga completa') + ': ' + restantes.length + ' docs restantes');
+
+        if (soloXML) {
+          // MODO RÁPIDO: descargar XMLs en paralelo (5 a la vez)
+          const { descargarXMLsParalelo } = require('./dianScraper');
+          const rapidos = await descargarXMLsParalelo(page, restantes, urlDescargaInfo, descargadosCUFE, function() {
+            global._edianDescargados = (global._edianDescargados||0) + 1;
+            emitProgreso && emitProgreso({ fase:'descargando', n: global._edianDescargados, total: global._edianTotal||0 });
+          });
+          rapidos.forEach(function(r){ documentos.push(r); });
+        } else {
+        // MODO COMPLETO: descargar PDFs+XMLs uno a uno
         for (const doc of g.docs) {
           if (descargadosCUFE[doc.cufe]) continue;
           console.log('  [DL URL] ' + doc.nombre);
@@ -607,7 +619,9 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa }
           descargadosCUFE[doc.cufe] = true;
           totalDescargadosGrupo++;
           documentos.push({ ...doc, pdfBuffer: archivos?.pdfBuffer||null, xmlBuffer: archivos?.xmlBuffer||null, xmlText: archivos?.xmlText||'' });
+          global._edianDescargados = (global._edianDescargados||0) + 1;
         }
+        } // end modo completo
         console.log('[DIAN] Grupo ' + g.grp + ' (URL directa): ' + totalDescargadosGrupo + '/' + g.docs.length);
       } else {
         console.log('[DIAN] URL no encontrada, usando paginacion...');
@@ -727,3 +741,94 @@ async function diagnosticarPortal(tokenUrl) {
 }
 
 module.exports = { descargarDIAN, diagnosticarPortal, parseTokenUrl };
+
+// ── MODO RÁPIDO: solo XMLs sin PDFs ───────────────────────────────────────────
+// Usa fetch directo con cookies de sesión del browser, sin clicks
+// 3-5x más rápido que el modo completo
+async function descargarSoloXMLs(page, cufe, urlInfo) {
+  try {
+    // Si tenemos URL de descarga directa, usarla con fetch paralelo
+    if (urlInfo && urlInfo.url) {
+      let url = urlInfo.url;
+      let body = urlInfo.bodyTemplate;
+      if (body) {
+        body = body.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
+        body = body.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
+        body = body.replace(/id=[^&]+/, 'id=' + encodeURIComponent(cufe));
+        body = body.replace(/[0-9a-f]{64,}/, cufe);
+      }
+      if (urlInfo.method === 'GET') {
+        url = url.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
+        url = url.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
+      }
+
+      // Fetch directo desde el browser (usa cookies de sesión)
+      const result = await page.evaluate(async function(params) {
+        try {
+          const resp = await fetch(params.url, {
+            method: params.method || 'GET',
+            headers: params.body ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {},
+            body: params.body || undefined,
+            credentials: 'include',
+          });
+          if (!resp.ok) return { error: 'HTTP ' + resp.status };
+          const arrayBuf = await resp.arrayBuffer();
+          // Convert to base64 for transfer
+          const bytes = new Uint8Array(arrayBuf);
+          let binary = '';
+          bytes.forEach(function(b) { binary += String.fromCharCode(b); });
+          return { ok: true, base64: btoa(binary), contentType: resp.headers.get('content-type') || '' };
+        } catch(e) { return { error: e.message }; }
+      }, { url, method: urlInfo.method, body: body || null });
+
+      if (result && result.ok && result.base64) {
+        const buffer = Buffer.from(result.base64, 'base64');
+        // Extract XML from ZIP
+        let xmlText = '', xmlBuffer = null;
+        try {
+          const JSZip2 = require('jszip');
+          const zip = await JSZip2.loadAsync(buffer);
+          for (const [fn, file] of Object.entries(zip.files)) {
+            if (fn.toLowerCase().endsWith('.xml')) {
+              xmlBuffer = await file.async('nodebuffer');
+              xmlText = xmlBuffer.toString('utf8');
+              break;
+            }
+          }
+        } catch(e) {
+          // Maybe it IS the xml directly
+          xmlText = buffer.toString('utf8');
+          if (xmlText.includes('<?xml') || xmlText.includes('<Invoice')) {
+            xmlBuffer = buffer;
+          }
+        }
+        return { pdfBuffer: null, xmlBuffer, xmlText };
+      }
+    }
+    return { pdfBuffer: null, xmlBuffer: null, xmlText: '' };
+  } catch(e) {
+    console.error('[XML FAST]', e.message.substring(0,80));
+    return { pdfBuffer: null, xmlBuffer: null, xmlText: '' };
+  }
+}
+
+// Descarga XMLs en lotes paralelos (5 a la vez)
+async function descargarXMLsParalelo(page, docs, urlInfo, descargadosCUFE, onProgress) {
+  const BATCH = 5;
+  const resultados = [];
+  for (let i = 0; i < docs.length; i += BATCH) {
+    const lote = docs.slice(i, i + BATCH);
+    const promesas = lote.map(async function(doc) {
+      if (descargadosCUFE[doc.cufe]) return null;
+      const archivos = await descargarSoloXMLs(page, doc.cufe, urlInfo);
+      descargadosCUFE[doc.cufe] = true;
+      if (onProgress) onProgress();
+      return { ...doc, pdfBuffer: null, xmlBuffer: archivos.xmlBuffer, xmlText: archivos.xmlText };
+    });
+    const loteRes = await Promise.all(promesas);
+    loteRes.forEach(function(r) { if (r) resultados.push(r); });
+  }
+  return resultados;
+}
+
+module.exports.descargarXMLsParalelo = descargarXMLsParalelo;
