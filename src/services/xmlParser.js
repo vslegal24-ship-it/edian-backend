@@ -65,32 +65,41 @@ async function parseXmlDIAN(xmlText) {
     return (cur && cur.$) ? cur.$ : {};
   };
 
-  // Determina tipo de identificación según schemeName
-  const tipoIdCodigo = (schemeName, nit) => {
-    const s = String(schemeName || '').trim();
-    if (s === '31' || s === 'NIT') return '31';
-    if (s === '13' || s === 'CC')  return '13';
-    if (s === '22' || s === 'CE')  return '22';
-    if (s === '11')                return '11'; // Registro civil
-    if (s === '12')                return '12'; // Tarjeta identidad
-    if (s === '21')                return '21'; // Tarjeta extranjería
-    if (s === '41')                return '41'; // Pasaporte
-    if (s === '42')                return '42'; // Doc identificación extranjero
-    if (s === '50')                return '50'; // NIT otro país
-    // Inferir por longitud si no tiene schemeName
+  // Determina tipo de identificación con múltiples estrategias
+  const tipoIdCodigo = (elementOrAttrs, nit) => {
+    // Estrategia 1: leer atributos del elemento xml2js (pueden venir de distintas formas)
+    let schemeName = '';
+    if (elementOrAttrs && typeof elementOrAttrs === 'object') {
+      const attrs = elementOrAttrs.$ || elementOrAttrs;
+      schemeName = String(attrs.schemeName || attrs.schemeID || '').trim();
+    } else {
+      schemeName = String(elementOrAttrs || '').trim();
+    }
+
+    // Mapeo directo por schemeName
+    const mapa = {'31':'31','NIT':'31','13':'13','CC':'13','12':'12',
+      '22':'22','CE':'22','11':'11','21':'21','41':'41','42':'42','50':'50'};
+    if (mapa[schemeName]) return mapa[schemeName];
+
+    // Estrategia 2: inferir por número de dígitos del NIT
     const n = String(nit || '').replace(/[^0-9]/g, '');
-    if (n.length === 9) return '31'; // NIT colombiano
-    if (n.length === 10 || n.length === 7 || n.length === 8) return '13'; // CC
+    // NITs colombianos: 8 o 9 dígitos, empiezan por 8 o 9
+    if (n.length === 9 && (n[0]==='8'||n[0]==='9')) return '31';
+    if (n.length === 8 && (n.startsWith('80')||n.startsWith('81')||
+        n.startsWith('89')||n.startsWith('90')||n.startsWith('91'))) return '31';
+    // Cédulas: 7 o 10 dígitos
+    if (n.length === 10 || n.length === 7) return '13';
+    // Por defecto 9 dígitos = NIT
+    if (n.length === 9) return '31';
     return '31';
   };
 
   const supCompanyEl = sup?.PartyTaxScheme?.CompanyID || sup?.PartyIdentification?.ID;
-  const supAttrs = (supCompanyEl && supCompanyEl.$) ? supCompanyEl.$ : {};
   const emisorNit = get(sup, 'PartyTaxScheme', 'CompanyID') || get(sup, 'PartyIdentification', 'ID');
 
   const emisor = {
     nit:      emisorNit,
-    tipoId:   tipoIdCodigo(supAttrs.schemeName || supAttrs.schemeID, emisorNit),
+    tipoId:   tipoIdCodigo(supCompanyEl, emisorNit),
     nombre:   get(sup, 'PartyTaxScheme', 'RegistrationName') || get(sup, 'PartyName', 'Name'),
     dir:      get(sup, 'PhysicalLocation', 'Address', 'AddressLine', 'Line'),
     ciudad:   get(sup, 'PhysicalLocation', 'Address', 'CityName'),
@@ -108,12 +117,11 @@ async function parseXmlDIAN(xmlText) {
   // ── Receptor ──────────────────────────────────────────────
   const cus = root.AccountingCustomerParty?.Party || {};
   const cusCompanyEl = cus?.PartyTaxScheme?.CompanyID || cus?.PartyIdentification?.ID;
-  const cusAttrs = (cusCompanyEl && cusCompanyEl.$) ? cusCompanyEl.$ : {};
   const receptorNit = get(cus, 'PartyTaxScheme', 'CompanyID') || get(cus, 'PartyIdentification', 'ID');
 
   const receptor = {
     nit:      receptorNit,
-    tipoId:   tipoIdCodigo(cusAttrs.schemeName || cusAttrs.schemeID, receptorNit),
+    tipoId:   tipoIdCodigo(cusCompanyEl, receptorNit),
     nombre:   get(cus, 'PartyTaxScheme', 'RegistrationName') || get(cus, 'PartyName', 'Name'),
     dir:      get(cus, 'PhysicalLocation', 'Address', 'AddressLine', 'Line'),
     ciudad:   get(cus, 'PhysicalLocation', 'Address', 'CityName'),
