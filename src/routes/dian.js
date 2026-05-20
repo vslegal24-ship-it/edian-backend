@@ -48,7 +48,20 @@ router.post('/descargar', async (req, res) => {
     console.log(`[API] Iniciando descarga: ${fechaInicio} a ${fechaFin}`);
 
     // 1. Descargar PDFs + XMLs de la DIAN
-    const { documentos, nit, total } = await descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo });
+    global._edianDescargados = 0;
+    global._edianTotal = 0;
+    emitProgreso({ fase: 'conectando', n: 0, total: 0 });
+    const _progressInterval = setInterval(() => {
+      const n = global._edianDescargados || 0;
+      const t = global._edianTotal || 0;
+      if (t > 0) emitProgreso({ fase: 'descargando', n, total: t });
+    }, 1000);
+    let documentos, nit, total;
+    try {
+      ({ documentos, nit, total } = await descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo }));
+    } finally {
+      clearInterval(_progressInterval);
+    }
 
     if (documentos.length === 0) {
       return res.json({
@@ -185,6 +198,33 @@ router.post('/diagnosticar', async (req, res) => {
  * GET /api/dian/zip/:key
  * Sirve el ZIP cacheado generado durante la descarga
  */
+// ── GET /api/dian/progreso — Server-Sent Events para progreso en tiempo real ──
+const _progresoClients = new Set();
+
+router.get('/progreso', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const client = { res, id: Date.now() };
+  _progresoClients.add(client);
+
+  // Send current state immediately
+  const state = global._edianProgreso || { n: 0, total: 0, fase: 'idle' };
+  res.write('data: ' + JSON.stringify(state) + '\n\n');
+
+  req.on('close', () => _progresoClients.delete(client));
+});
+
+function emitProgreso(data) {
+  global._edianProgreso = data;
+  const msg = 'data: ' + JSON.stringify(data) + '\n\n';
+  for (const client of _progresoClients) {
+    try { client.res.write(msg); } catch(e) { _progresoClients.delete(client); }
+  }
+}
+
 // ── GET /api/dian/ultimo — último proceso completado ─────────
 router.get('/ultimo', (req, res) => {
   if (zipCache.size === 0) return res.json({ ok: false, error: 'No hay procesos recientes en caché' });
