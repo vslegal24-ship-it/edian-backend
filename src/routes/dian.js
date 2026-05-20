@@ -38,7 +38,8 @@ router.post('/validar-token', (req, res) => {
  * Body: { tokenUrl, fechaInicio, fechaFin, grupo?, empresa? }
  */
 router.post('/descargar', async (req, res) => {
-  const { tokenUrl, fechaInicio, fechaFin, grupo = '', empresa = 'EDIAN' } = req.body;
+  const { tokenUrl, fechaInicio, fechaFin, grupo = '', empresa = 'EDIAN', modulos = ['soportes','terceros','items'] } = req.body;
+  const soloXML = !modulos.includes('soportes'); // Si no piden soportes, solo XMLs (más rápido)
 
   if (!tokenUrl || !fechaInicio || !fechaFin) {
     return res.status(400).json({ error: 'tokenUrl, fechaInicio y fechaFin son requeridos' });
@@ -58,7 +59,7 @@ router.post('/descargar', async (req, res) => {
     }, 1000);
     let documentos, nit, total;
     try {
-      ({ documentos, nit, total } = await descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo }));
+      ({ documentos, nit, total } = await descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloXML }));
     } finally {
       clearInterval(_progressInterval);
     }
