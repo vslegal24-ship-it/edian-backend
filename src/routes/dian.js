@@ -10,7 +10,7 @@ const zipCache = new Map();
 function limpiarCacheVieja() {
   const ahora = Date.now();
   for (const [key, val] of zipCache.entries()) {
-    if (ahora - val.timestamp > 30 * 60 * 1000) zipCache.delete(key);
+    if (ahora - val.timestamp > 120 * 60 * 1000) zipCache.delete(key);
   }
 }
 setInterval(limpiarCacheVieja, 5 * 60 * 1000);
