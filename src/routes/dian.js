@@ -185,6 +185,30 @@ router.post('/diagnosticar', async (req, res) => {
  * GET /api/dian/zip/:key
  * Sirve el ZIP cacheado generado durante la descarga
  */
+// ── GET /api/dian/ultimo — último proceso completado ─────────
+router.get('/ultimo', (req, res) => {
+  if (zipCache.size === 0) return res.json({ ok: false, error: 'No hay procesos recientes en caché' });
+  // Get most recent entry
+  let latest = null;
+  for (const [key, val] of zipCache.entries()) {
+    if (!latest || val.timestamp > latest.timestamp) {
+      latest = { key, ...val };
+    }
+  }
+  if (!latest) return res.json({ ok: false, error: 'No hay procesos disponibles' });
+  const mins = Math.round((Date.now() - latest.timestamp) / 60000);
+  res.json({
+    ok: true,
+    zipKey: latest.key,
+    empresa: latest.empresa || '—',
+    fechaIni: latest.fechaIni || '—',
+    fechaFin: latest.fechaFin || '—',
+    nFacturas: latest.nFacturas || 0,
+    hace: mins + ' min',
+    expiraEn: Math.max(0, 30 - mins) + ' min',
+  });
+});
+
 router.get('/zip/:key', (req, res) => {
   const cached = zipCache.get(req.params.key);
   if (!cached) return res.status(404).json({ error: 'ZIP no encontrado o expirado. Descarga de nuevo.' });
