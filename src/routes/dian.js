@@ -1,834 +1,310 @@
-const { chromium } = require('playwright');
+const express = require('express');
+const router = express.Router();
+const { descargarDIAN, diagnosticarPortal, parseTokenUrl } = require('../services/dianScraper');
+const { procesarLote } = require('../services/xmlParser');
+const { generarExcelItems, generarExcelResumen } = require('../utils/excelGenerator');
 const JSZip = require('jszip');
-const fs = require('fs');
 
-function parseTokenUrl(url) {
+// Cache temporal de ZIPs generados (se limpian despues de 30 min)
+const zipCache = new Map();
+function limpiarCacheVieja() {
+  const ahora = Date.now();
+  for (const [key, val] of zipCache.entries()) {
+    if (ahora - val.timestamp > 120 * 60 * 1000) zipCache.delete(key);
+  }
+}
+setInterval(limpiarCacheVieja, 5 * 60 * 1000);
+
+/**
+ * POST /api/dian/validar-token
+ * Valida el formato del token URL antes de lanzar el proceso
+ */
+router.post('/validar-token', (req, res) => {
   try {
-    const u = new URL(url.trim());
-    const rk = u.searchParams.get('rk');
-    const token = u.searchParams.get('token');
-    const pk = u.searchParams.get('pk') || '';
-    if (!rk || !token) throw new Error('Faltan parametros rk o token');
-    return { nit: rk, token, pk };
-  } catch(e) { throw new Error('URL del token invalida: ' + e.message); }
-}
-
-function toFechaDIAN(iso) {
-  const [y, m, d] = iso.split('-');
-  return parseInt(m) + '/' + parseInt(d) + '/' + y + ' 12:00:00 AM';
-}
-
-function dividirEnMeses(fechaInicio, fechaFin) {
-  const rangos = [];
-  let cur = new Date(fechaInicio + 'T00:00:00');
-  const fin = new Date(fechaFin + 'T00:00:00');
-  while (cur <= fin) {
-    const ini = cur.toISOString().split('T')[0];
-    const ultimoDia = new Date(cur.getFullYear(), cur.getMonth() + 1, 0);
-    const endMes = ultimoDia <= fin ? ultimoDia.toISOString().split('T')[0] : fechaFin;
-    rangos.push({ desde: ini, hasta: endMes });
-    cur = new Date(cur.getFullYear(), cur.getMonth() + 1, 1);
+    const { tokenUrl } = req.body;
+    if (!tokenUrl) return res.status(400).json({ error: 'tokenUrl requerido' });
+    const data = parseTokenUrl(tokenUrl);
+    res.json({ ok: true, nit: data.nit, tokenPreview: data.token.substring(0, 8) + '...' });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
   }
-  return rangos;
-}
+});
 
 /**
- * Autentica y retorna la pagina con sesion activa.
+ * POST /api/dian/descargar
+ * Descarga documentos del portal DIAN, parsea XMLs y devuelve
+ * las filas (1 por ítem) + las facturas completas.
+ *
+ * Body: { tokenUrl, fechaInicio, fechaFin, grupo?, empresa? }
  */
-async function autenticar(context, page, pk, nit, token) {
-  console.log('[DIAN] Autenticando NIT ' + nit);
-  await page.goto(
-    'https://catalogo-vpfe.dian.gov.co/User/AuthToken?pk=' + pk + '&rk=' + nit + '&token=' + token,
-    { waitUntil: 'networkidle', timeout: 40000 }
-  );
-  if (page.url().includes('login') || page.url().includes('Login')) {
-    throw new Error('Token invalido o expirado. Solicita un nuevo token en la DIAN.');
-  }
-  console.log('[DIAN] Autenticado OK — URL: ' + page.url());
-}
+router.post('/descargar', async (req, res) => {
+  const { tokenUrl, fechaInicio, fechaFin, grupo = '', empresa = 'EDIAN', modulos = ['soportes','terceros','items'] } = req.body;
+  const soloXML = !modulos.includes('soportes'); // Si no piden soportes, solo XMLs (más rápido)
 
-/**
- * Obtiene TODOS los CUFEs interceptando la llamada AJAX de DataTables.
- * Cuando el portal hace la busqueda, interceptamos la peticion y la
- * repetimos con length=10000 para traer todos los registros.
- */
-async function obtenerCUFEsViaAjax(page, url, startDate, endDate, startISO, endISO) {
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  console.log('[DIAN] Pagina cargada: ' + page.url());
-
-  // Inyectar fechas
-  await page.evaluate(function(p) {
-    var sEl = document.getElementById('startDate'); if (sEl) sEl.value = p.start;
-    var eEl = document.getElementById('endDate');   if (eEl) eEl.value = p.end;
-    var rEl = document.getElementById('dashboard-report-range');
-    if (rEl) {
-      rEl.value = p.startISO + ' - ' + p.endISO;
-      rEl.dispatchEvent(new Event('change', { bubbles: true }));
-      if (window.$ && $(rEl).data) {
-        try { var dr = $(rEl).data('daterangepicker'); if (dr) { dr.setStartDate(p.startISO); dr.setEndDate(p.endISO); } } catch(e) {}
-      }
-    }
-  }, { start: startDate, end: endDate, startISO, endISO });
-
-  // Configurar interceptor ANTES de hacer busqueda
-  let ajaxUrl = null;
-  let ajaxPayload = null;
-  let ajaxHeaders = {};
-
-  page.on('request', function(req) {
-    const u = req.url();
-    const m = req.method();
-    if (m === 'POST' && (u.includes('GetDocuments') || u.includes('datatables') || u.includes('DataTable') || u.includes('ajax'))) {
-      ajaxUrl = u;
-      ajaxPayload = req.postData();
-      ajaxHeaders = req.headers();
-      console.log('[AJAX] Interceptado: ' + u);
-    }
-  });
-
-  // Tambien interceptar respuestas para capturar la URL del DataTable
-  const respuestasCapturadas = [];
-  page.on('response', async function(resp) {
-    try {
-      const u = resp.url();
-      const ct = resp.headers()['content-type'] || '';
-      if (ct.includes('json') && u.includes('catalogo-vpfe.dian.gov.co') && resp.status() === 200) {
-        const body = await resp.text();
-        if (body.includes('"data"') || body.includes('"recordsTotal"') || body.includes('"cufe"') || body.includes('"Cufe"')) {
-          respuestasCapturadas.push({ url: u, body: body.substring(0, 2000) });
-          console.log('[AJAX RESP] JSON de DIAN: ' + u + ' | ' + body.substring(0, 100));
-        }
-      }
-    } catch(e) {}
-  });
-
-  // Hacer busqueda
-  await page.evaluate(function() {
-    var b = Array.from(document.querySelectorAll('button, input[type=submit]')).find(function(x) {
-      return (x.textContent + (x.value||'')).toLowerCase().includes('buscar');
-    });
-    if (b) b.click();
-    else { var f = document.querySelector('form'); if (f) f.submit(); }
-  });
-
-  await page.waitForTimeout(200);
-  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(function(){});
-
-  console.log('[DIAN] AJAX URL interceptada:', ajaxUrl);
-  console.log('[DIAN] Respuestas JSON capturadas:', respuestasCapturadas.length);
-
-  // Si capturamos el AJAX, repetirlo con length=10000
-  if (ajaxUrl) {
-    try {
-      // Modificar el payload para traer todos los registros
-      let nuevoPayload = ajaxPayload || '';
-      nuevoPayload = nuevoPayload.replace(/length=-?\d+/, 'length=10000').replace(/length%3D-?\d+/, 'length%3D10000');
-      if (!nuevoPayload.includes('length')) nuevoPayload += '&length=10000&start=0';
-
-      const respAll = await page.evaluate(async function(params) {
-        try {
-          var resp = await fetch(params.url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest' },
-            body: params.payload,
-            credentials: 'include',
-          });
-          var text = await resp.text();
-          return { ok: resp.ok, status: resp.status, body: text };
-        } catch(e) { return { error: e.message }; }
-      }, { url: ajaxUrl, payload: nuevoPayload });
-
-      if (respAll && respAll.ok && respAll.body) {
-        console.log('[DIAN] Respuesta AJAX completa: ' + respAll.body.length + ' chars');
-        const data = JSON.parse(respAll.body);
-        const rows = data.data || data.Data || data.rows || data.Rows || [];
-        console.log('[DIAN] Registros en AJAX: ' + rows.length);
-        if (rows.length > 0) return parsearFilasAjax(rows);
-      }
-    } catch(e) {
-      console.log('[DIAN] Error repitiendo AJAX:', e.message);
-    }
+  if (!tokenUrl || !fechaInicio || !fechaFin) {
+    return res.status(400).json({ error: 'tokenUrl, fechaInicio y fechaFin son requeridos' });
   }
 
-  // Fallback: extraer de la UI con DataTables API
-  return await extraerViaDataTables(page);
-}
+  try {
+    console.log(`[API] Iniciando descarga: ${fechaInicio} a ${fechaFin}`);
 
-/**
- * Parsea las filas que vienen del AJAX de la DIAN.
- * Los campos pueden venir en diferentes formatos.
- */
-function parsearFilasAjax(rows) {
-  // Log first row to see all available fields
-  if (rows.length > 0) console.log('[AJAX] Campos disponibles:', Object.keys(rows[0]).join(', '));
-
-  const resultado = [];
-  rows.forEach(function(r) {
-    // El CUFE viene en el campo "Id" segun la DIAN
-    const cufe = r.Id || r.id || r.cufe || r.Cufe || r.CUFE || r.documentKey || r.DocumentKey || r.uuid || r.UUID || '';
-    if (!cufe || cufe.length < 20) return;
-
-    // Extraer todos los campos disponibles
-    // Campos DIAN conocidos del JSON: Id, FechaEmision, FechaRecepcion, Prefijo, NumeroDocumento,
-    // TipoDocumento, NitEmisor, NombreEmisor, NitReceptor, NombreReceptor, Total, Estado
-    // Campos reales del JSON de la DIAN (confirmados via log)
-    const folio   = r.Number   || r.NumeroDocumento || '';
-    const prefijo = r.Serie    || r.Prefijo || '';
-    const fecha   = r.EmissionDate || r.ReceptionDate || '';
-    const tipo    = r.DocumentTypeName || r.TipoDocumento || 'Factura electronica';
-    const nitEmi  = r.SenderCode   || '';
-    const nomEmi  = r.SenderName   || '';
-    const nitRec  = r.ReceiverCode || '';
-    const nomRec  = r.ReceiverName || '';
-    const total   = r.TotalAmount  || r.Amount || 0;
-    const iva     = r.TaxAmountIva || 0;
-    const estado  = r.StatusName   || '';
-    const nombre  = (prefijo ? prefijo + '-' : '') + folio;
-
-    resultado.push({
-      cufe: String(cufe),
-      cells: [tipo, String(cufe), folio, prefijo, '', '', '', fecha, '', nitEmi, nomEmi, nitRec, nomRec],
-      tipo, fecha, prefijo, folio, nombre,
-      nitEmisor: nitEmi, nomEmisor: nomEmi,
-      nitReceptor: nitRec, nomReceptor: nomRec,
-      total, iva, estado,
-    });
-  });
-  console.log('[AJAX] CUFEs parseados: ' + resultado.length + ' de ' + rows.length);
-  return resultado;
-}
-
-/**
- * Fallback: usar la API de DataTables para cambiar page length a -1 (todos).
- */
-async function extraerViaDataTables(page) {
-  const resultado = await page.evaluate(function() {
-    var filas = [];
-
-    // Intentar DataTables API
+    // 1. Descargar PDFs + XMLs de la DIAN
+    global._edianDescargados = 0;
+    global._edianTotal = 0;
+    emitProgreso({ fase: 'conectando', n: 0, total: 0 });
+    const _progressInterval = setInterval(() => {
+      const n = global._edianDescargados || 0;
+      const t = global._edianTotal || 0;
+      if (t > 0) emitProgreso({ fase: 'descargando', n, total: t });
+    }, 1000);
+    let documentos, nit, total;
     try {
-      if (window.$ && $.fn.DataTable) {
-        var tables = $.fn.DataTable.tables({ api: true });
-        if (!tables || !tables.rows) {
-          // Otra forma de obtener instancias
-          var tbl = $('table.dataTable').first();
-          if (tbl.length) {
-            var dt = tbl.DataTable();
-            // Cambiar a mostrar todo
-            dt.page.len(-1).draw(false);
-            // Esperar el redibujado (no podemos hacer await aqui)
-          }
-        }
-      }
-    } catch(e) {}
+      ({ documentos, nit, total } = await descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloXML }));
+    } finally {
+      clearInterval(_progressInterval);
+    }
 
-    // Extraer filas visibles + ocultas (DataTables guarda todo en el DOM)
-    var seenCUFEs = {};
-    var rows = document.querySelectorAll('table tbody tr');
-    rows.forEach(function(tr) {
-      if (tr.style.display === 'none' && !tr.className.includes('child')) return;
-      var cells = Array.from(tr.querySelectorAll('td')).map(function(td) {
-        return td.textContent.trim().replace(/\s+/g, ' ');
+    if (documentos.length === 0) {
+      return res.json({
+        ok: true, total: 0, filas: [], facturas: [],
+        mensaje: 'No se encontraron documentos en el período indicado',
       });
-      var btn = tr.querySelector('button.download-document, button[data-id]');
-      var cufe = btn ? (btn.getAttribute('data-id') || btn.id || '') : '';
-      if (cells.length > 2 && cufe && !seenCUFEs[cufe]) {
-        seenCUFEs[cufe] = true;
-        filas.push({ cells: cells, cufe: cufe });
-      }
-    });
-    return filas;
-  });
+    }
 
-  // Si solo tenemos la primera pagina, paginar manualmente
-  if (resultado.length <= 10) {
-    console.log('[DIAN] Solo ' + resultado.length + ' filas visibles, paginando...');
-    return await paginarManual(page, resultado);
-  }
-  return resultado;
-}
+    // 2. Parsear todos los XMLs
+    const xmlTexts = documentos.map(d => ({ xmlText: d.xmlText, nombre: d.nombre || d.folio || '', grupo: d.grupo || '' }));
+    const { facturas, filas, errores } = await procesarLote(xmlTexts);
 
-async function paginarManual(page, filasIniciales) {
-  const todos = [...filasIniciales];
-  const seenCUFEs = {};
-  todos.forEach(function(f) { seenCUFEs[f.cufe] = true; });
-  let pg = 2;
+    console.log(`[API] Procesados: ${facturas.length} facturas, ${filas.length} ítems`);
 
-  while (pg <= 30) {
-    const clicado = await page.evaluate(function(pgNum) {
-      // Intentar por numero de pagina
-      var links = document.querySelectorAll('.paginate_button:not(.previous):not(.next):not(.first):not(.last)');
-      for (var i = 0; i < links.length; i++) {
-        if (links[i].textContent.trim() === String(pgNum) && !links[i].classList.contains('active')) {
-          links[i].click(); return 'pg-' + pgNum;
-        }
-      }
-      // Intentar "Siguiente"
-      var next = document.querySelector('#tbl-documents_next:not(.disabled), a.next:not(.disabled), li.next:not(.disabled) a');
-      if (next) { next.click(); return 'next'; }
-      return null;
-    }, pg);
+    // Generar ZIP inmediatamente y cachearlo (los buffers solo existen aqui)
+    let zipKey = null;
+    try {
+      const zipObj = new JSZip();
+      const folder = zipObj.folder('facturas');
 
-    if (!clicado) break;
-    await page.waitForTimeout(300);
-
-    const nuevas = await page.evaluate(function(seen) {
-      var filas = [];
-      document.querySelectorAll('table tbody tr').forEach(function(tr) {
-        var btn = tr.querySelector('button.download-document, button[data-id]');
-        var cufe = btn ? (btn.getAttribute('data-id') || btn.id || '') : '';
-        if (!cufe || seen[cufe]) return;
-        var cells = Array.from(tr.querySelectorAll('td')).map(function(td) { return td.textContent.trim().replace(/\s+/g,' '); });
-        if (cells.length > 2) filas.push({ cells: cells, cufe: cufe });
+      // Excel detallado adentro del ZIP
+      const { buffer: xlsBuf, filename: xlsName } = generarExcelItems(filas, facturas, {
+        empresa, fechaIni: fechaInicio, fechaFin,
       });
-      var isLast = !document.querySelector('#tbl-documents_next:not(.disabled), .paginate_button.next:not(.disabled)');
-      return { filas: filas, isLast: isLast };
-    }, seenCUFEs);
+      folder.file(xlsName, xlsBuf);
 
-    console.log('[DIAN] Pag ' + pg + ': ' + nuevas.filas.length + ' nuevas | total: ' + (todos.length + nuevas.filas.length));
-    nuevas.filas.forEach(function(f) { seenCUFEs[f.cufe] = true; todos.push(f); });
-    if (nuevas.isLast || nuevas.filas.length === 0) break;
-    pg++;
+      // PDF y XML de cada documento renombrados
+      for (const doc of documentos) {
+        const nitEmi  = (doc.emisor && doc.emisor.nit)    || doc.nitEmisor || '';
+        const nomEmi  = (doc.emisor && doc.emisor.nombre) || doc.nomEmisor || '';
+        const folio   = (doc.folio || doc.numero || 'sin-folio').replace(/[^a-zA-Z0-9\-]/g, '_');
+        const fecha   = (doc.fecha || '').replace(/[^0-9]/g, '').substring(0, 8);
+        const nomL    = nomEmi.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').substring(0, 20);
+        const base    = [nitEmi, nomL, folio, fecha].filter(Boolean).join('_');
+        if (doc.pdfBuffer) folder.file(base + '.pdf', doc.pdfBuffer);
+        if (doc.xmlBuffer) folder.file(base + '.xml', doc.xmlBuffer);
+        else if (doc.xmlText) folder.file(base + '.xml', doc.xmlText);
+      }
+
+      const zipBuffer = await zipObj.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+      zipKey = Date.now() + '_' + nit;
+      const emp = empresa.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 20);
+      const fi  = (fechaInicio || '').replace(/-/g, '');
+      const ff  = (fechaFin    || '').replace(/-/g, '');
+      zipCache.set(zipKey, {
+        buffer: zipBuffer,
+        filename: emp + '_' + fi + '_' + ff + '.zip',
+        timestamp: Date.now(),
+      });
+      console.log('[ZIP] Cacheado:', zipKey, '(' + zipBuffer.length + ' bytes)');
+    } catch (zipErr) {
+      console.error('[ZIP] Error generando cache:', zipErr.message);
+    }
+
+    res.json({
+      ok: true,
+      nit,
+      total: documentos.length,
+      facturas: facturas.length,
+      items: filas.length,
+      filas,
+      facturas_data: facturas,
+      errores,
+      zipKey,
+      periodo: { desde: fechaInicio, hasta: fechaFin },
+      empresa,
+    });
+
+  } catch (err) {
+    console.error('[API] Error en descarga:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
   }
-  return todos;
-}
+});
 
 /**
- * Encuentra el patron de URL de descarga interceptando el primer click.
- * Retorna la funcion de descarga que usa fetch directo.
+ * POST /api/dian/excel-items
+ * Genera y descarga el Excel detallado (1 fila por ítem)
+ * a partir de los datos ya procesados.
+ *
+ * Body: { filas, facturas_data, empresa, fechaInicio, fechaFin }
  */
-async function encontrarUrlDescarga(page, primerCufe) {
-  let downloadUrl = null;
-  let downloadMethod = null;
-  let downloadBody = null;
+router.post('/excel-items', (req, res) => {
+  const { filas, facturas_data, empresa = 'EDIAN', fechaInicio, fechaFin } = req.body;
+  if (!filas || !filas.length) return res.status(400).json({ error: 'Sin datos para generar Excel' });
 
-  // Interceptar requests para encontrar el patron
-  const handler = function(req) {
-    const u = req.url();
-    const m = req.method();
-    if (u.includes('Download') || u.includes('download') || u.includes('GetFile') || u.includes('getfile') || u.includes('Zip') || u.includes('zip')) {
-      if (u.includes('dian.gov.co') || u.includes('catalogo')) {
-        downloadUrl = u;
-        downloadMethod = m;
-        downloadBody = req.postData();
-        console.log('[INTERCEPT DL] ' + m + ' ' + u + (downloadBody ? ' body:'+downloadBody.substring(0,100) : ''));
-      }
-    }
-  };
-  page.on('request', handler);
-
-  // Hacer el primer click para capturar la URL
   try {
-    await Promise.all([
-      page.waitForEvent('download', { timeout: 20000 }),
-      page.evaluate(function(id) {
-        var el = document.getElementById(id);
-        if (!el) {
-          var btns = document.querySelectorAll('button[data-id]');
-          for (var i = 0; i < btns.length; i++) {
-            if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; }
-          }
-        }
-        if (el) { el.click(); return true; }
-        return false;
-      }, primerCufe),
-    ]);
-  } catch(e) {
-    console.log('[INTERCEPT DL] Error en primer click:', e.message.substring(0,80));
+    const { buffer, filename } = generarExcelItems(filas, facturas_data || [], {
+      empresa, fechaIni: fechaInicio, fechaFin,
+    });
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.send(buffer);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  page.off('request', handler);
-
-  if (downloadUrl) {
-    console.log('[DIAN] URL de descarga encontrada: ' + downloadMethod + ' ' + downloadUrl);
-    return { url: downloadUrl, method: downloadMethod, bodyTemplate: downloadBody };
-  }
-  return null;
-}
+});
 
 /**
- * Descarga un documento usando fetch directo con la URL conocida.
+ * POST /api/dian/excel-resumen
+ * Genera el Excel igual al export de la DIAN (1 fila por factura)
  */
-async function descargarViaUrl(page, cufe, urlInfo) {
+router.post('/excel-resumen', (req, res) => {
+  const { facturas_data, empresa = 'EDIAN', fechaInicio, fechaFin } = req.body;
+  if (!facturas_data || !facturas_data.length) return res.status(400).json({ error: 'Sin datos' });
+
   try {
-    // Construir la URL con el CUFE del documento
-    let url = urlInfo.url;
-    let body = urlInfo.bodyTemplate;
+    const { buffer, filename } = generarExcelResumen(facturas_data, {
+      empresa, fechaIni: fechaInicio, fechaFin,
+    });
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.send(buffer);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-    // Reemplazar el CUFE del primer documento con el actual
-    if (body) {
-      body = body.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
-      body = body.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
-      body = body.replace(/id=[^&]+/, 'id=' + encodeURIComponent(cufe));
-      body = body.replace(/documentKey=[^&]+/, 'documentKey=' + encodeURIComponent(cufe));
-      body = body.replace(/[0-9a-f]{64,}/, cufe);
-    }
-    if (urlInfo.method === 'GET') {
-      // Reemplazar el trackId u otro parametro que contenga el CUFE
-      url = url.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
-      url = url.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
-      url = url.replace(/id=[^&]+/, 'id=' + encodeURIComponent(cufe));
-      // Reemplazar CUFE en el path si aplica
-      url = url.replace(/[0-9a-f]{64,}/, cufe);
-    }
+/**
+ * POST /api/dian/diagnosticar
+ * Autentica y retorna la estructura HTML del portal para debug
+ */
+router.post('/diagnosticar', async (req, res) => {
+  const { tokenUrl } = req.body;
+  if (!tokenUrl) return res.status(400).json({ error: 'tokenUrl requerido' });
+  try {
+    const info = await diagnosticarPortal(tokenUrl);
+    res.json(info);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
-    const resultado = await page.evaluate(async function(params) {
-      try {
-        var resp;
-        if (params.method === 'GET') {
-          resp = await fetch(params.url, { credentials: 'include' });
-        } else {
-          resp = await fetch(params.url, {
-            method: params.method || 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
-            body: params.body,
-            credentials: 'include',
-          });
-        }
-        if (!resp.ok) return { error: 'HTTP ' + resp.status };
-        var arr = await resp.arrayBuffer();
-        return { size: arr.byteLength, data: Array.from(new Uint8Array(arr)) };
-      } catch(e) { return { error: e.message }; }
-    }, { url, method: urlInfo.method, body });
+/**
+ * GET /api/dian/zip/:key
+ * Sirve el ZIP cacheado generado durante la descarga
+ */
+// ── GET /api/dian/progreso — Server-Sent Events para progreso en tiempo real ──
+const _progresoClients = new Set();
 
-    if (resultado.error || !resultado.size) return null;
-    const buffer = Buffer.from(resultado.data);
-    let pdfBuffer = null, xmlBuffer = null, xmlText = '';
-    const JSZip2 = require('jszip');
-    try {
-      const zip = await JSZip2.loadAsync(buffer);
-      for (const [fn, file] of Object.entries(zip.files)) {
-        if (fn.toLowerCase().endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
-        if (fn.toLowerCase().endsWith('.xml')) { xmlBuffer = await file.async('nodebuffer'); xmlText = await file.async('text'); }
-      }
-    } catch(e) {}
-    return { pdfBuffer, xmlBuffer, xmlText };
-  } catch(e) {
-    console.error('[DL URL]', e.message.substring(0,80));
-    return null;
+router.get('/progreso', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const client = { res, id: Date.now() };
+  _progresoClients.add(client);
+
+  // Send current state immediately
+  const state = global._edianProgreso || { n: 0, total: 0, fase: 'idle' };
+  res.write('data: ' + JSON.stringify(state) + '\n\n');
+
+  req.on('close', () => _progresoClients.delete(client));
+});
+
+function emitProgreso(data) {
+  global._edianProgreso = data;
+  const msg = 'data: ' + JSON.stringify(data) + '\n\n';
+  for (const client of _progresoClients) {
+    try { client.res.write(msg); } catch(e) { _progresoClients.delete(client); }
   }
 }
 
-async function descargarDocumentoClick(page, cufe) {
-  try {
-    const [download] = await Promise.all([
-      page.waitForEvent('download', { timeout: 25000 }),
-      page.evaluate(function(id) {
-        var el = document.getElementById(id);
-        if (!el) {
-          var btns = document.querySelectorAll('button[data-id]');
-          for (var i = 0; i < btns.length; i++) {
-            if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; }
-          }
-        }
-        if (el) { el.click(); return true; }
-        return false;
-      }, cufe),
-    ]);
-    const buffer = fs.readFileSync(await download.path());
-    let pdfBuffer = null, xmlBuffer = null, xmlText = '';
-    try {
-      const zip = await JSZip.loadAsync(buffer);
-      for (const [fn, file] of Object.entries(zip.files)) {
-        if (fn.toLowerCase().endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
-        if (fn.toLowerCase().endsWith('.xml')) { xmlBuffer = await file.async('nodebuffer'); xmlText = await file.async('text'); }
-      }
-    } catch(e) {
-      const n = (download.suggestedFilename()||'').toLowerCase();
-      if (n.endsWith('.xml')) { xmlBuffer = buffer; xmlText = buffer.toString('utf8'); }
-      else if (n.endsWith('.pdf')) pdfBuffer = buffer;
+// ── GET /api/dian/ultimo — último proceso completado ─────────
+router.get('/ultimo', (req, res) => {
+  if (zipCache.size === 0) return res.json({ ok: false, error: 'No hay procesos recientes en caché' });
+  // Get most recent entry
+  let latest = null;
+  for (const [key, val] of zipCache.entries()) {
+    if (!latest || val.timestamp > latest.timestamp) {
+      latest = { key, ...val };
     }
-    return { pdfBuffer, xmlBuffer, xmlText };
-  } catch(e) {
-    console.error('  [ERR DL]', e.message.substring(0,80));
-    return null;
   }
-}
-
-async function buscarYNavegar(page, url, startDate, endDate, startISO, endISO) {
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.evaluate(function(p) {
-    var sEl = document.getElementById('startDate'); if (sEl) sEl.value = p.start;
-    var eEl = document.getElementById('endDate');   if (eEl) eEl.value = p.end;
-    var rEl = document.getElementById('dashboard-report-range');
-    if (rEl) {
-      rEl.value = p.startISO+' - '+p.endISO;
-      rEl.dispatchEvent(new Event('change',{bubbles:true}));
-      if (window.$ && $(rEl).data) { try { var dr=$(rEl).data('daterangepicker'); if(dr){dr.setStartDate(p.startISO);dr.setEndDate(p.endISO);} } catch(e){} }
-    }
-  }, { start: startDate, end: endDate, startISO, endISO });
-  await page.evaluate(function() {
-    var b = Array.from(document.querySelectorAll('button,input[type=submit]')).find(function(x){ return (x.textContent+(x.value||'')).toLowerCase().includes('buscar'); });
-    if (b) b.click(); else { var f=document.querySelector('form'); if(f) f.submit(); }
+  if (!latest) return res.json({ ok: false, error: 'No hay procesos disponibles' });
+  const mins = Math.round((Date.now() - latest.timestamp) / 60000);
+  res.json({
+    ok: true,
+    zipKey: latest.key,
+    empresa: latest.empresa || '—',
+    fechaIni: latest.fechaIni || '—',
+    fechaFin: latest.fechaFin || '—',
+    nFacturas: latest.nFacturas || 0,
+    hace: mins + ' min',
+    expiraEn: Math.max(0, 30 - mins) + ' min',
   });
-  await page.waitForTimeout(600);
-  await page.waitForLoadState('networkidle',{timeout:10000}).catch(function(){});
-  // Esperar a que el DataTables termine de cargar los resultados
-  await page.waitForFunction(function() {
-    var btns = document.querySelectorAll('button.download-document, button[data-id]');
-    return btns.length > 0;
-  }, { timeout: 10000 }).catch(function() {});
-  await page.waitForTimeout(150);
-}
+});
 
-// ── FUNCION PRINCIPAL ──────────────────────────────────────────
-async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa, soloXML = false }) {
-  const { nit, token, pk } = parseTokenUrl(tokenUrl);
-  const dias = Math.round((new Date(fechaFin+'T00:00:00') - new Date(fechaInicio+'T00:00:00')) / 86400000);
-  const rangos = dias > 31 ? dividirEnMeses(fechaInicio, fechaFin) : [{ desde: fechaInicio, hasta: fechaFin }];
-  console.log('[DIAN] Rangos:', rangos.length, '| Dias:', dias);
+router.get('/zip/:key', (req, res) => {
+  const cached = zipCache.get(req.params.key);
+  if (!cached) return res.status(404).json({ error: 'ZIP no encontrado o expirado. Descarga de nuevo.' });
+  res.setHeader('Content-Disposition', 'attachment; filename="' + cached.filename + '"');
+  res.setHeader('Content-Type', 'application/zip');
+  res.send(cached.buffer);
+});
 
-  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu'] });
-  const context = await browser.newContext({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36', acceptDownloads: true });
-  const page = await context.newPage();
-
+/**
+ * POST /api/dian/zip
+ * Genera ZIP con PDFs y XMLs renombrados: NIT_NombreEmisor_Folio_Fecha.pdf/xml
+ * + el Excel detallado adentro
+ */
+router.post('/zip', async (req, res) => {
+  const { filas, facturas_data, empresa = 'EDIAN', fechaInicio, fechaFin } = req.body;
+  if (!facturas_data || !facturas_data.length) {
+    return res.status(400).json({ error: 'Sin datos para generar ZIP' });
+  }
   try {
-    await autenticar(context, page, pk, nit, token);
+    const zip = new JSZip();
+    const folder = zip.folder('facturas');
 
-    // FASE 1: Recolectar todos los CUFEs
-    const todosDocumentos = [];
-    const seenCUFEs = {};
+    // Agregar Excel detallado
+    const { buffer: xlsBuffer, filename: xlsFilename } = generarExcelItems(
+      filas || [], facturas_data,
+      { empresa, fechaIni: fechaInicio, fechaFin }
+    );
+    folder.file(xlsFilename, xlsBuffer);
 
-    for (const rango of rangos) {
-      const startDate = toFechaDIAN(rango.desde);
-      const endDate   = toFechaDIAN(rango.hasta);
-      console.log('[DIAN] === Rango: ' + rango.desde + ' a ' + rango.hasta + ' ===');
+    // Agregar PDFs y XMLs con nombre: NIT_Nombre_Folio_Fecha
+    for (const fac of facturas_data) {
+      const nitEmi  = (fac.emisor && fac.emisor.nit)    || fac.nitEmisor || '';
+      const nomEmi  = (fac.emisor && fac.emisor.nombre) || fac.nomEmisor || '';
+      const folio   = (fac.folio || fac.numero || 'sin-folio').replace(/[^a-zA-Z0-9-]/g, '_');
+      const fecha   = (fac.fecha || '').replace(/[^0-9]/g, '').substring(0, 8);
+      const nomLimpio = nomEmi.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').substring(0, 20);
+      const baseName  = [nitEmi, nomLimpio, folio, fecha].filter(Boolean).join('_');
 
-      const urls = [];
-      if (!grupo || grupo === 'Recibido')       urls.push({ url: 'https://catalogo-vpfe.dian.gov.co/Document/Received',       grp: 'Recibido' });
-      if (!grupo || grupo === 'Emitido')         urls.push({ url: 'https://catalogo-vpfe.dian.gov.co/Document/Sent',           grp: 'Emitido' });
-      if (!grupo || grupo === 'NominaEmitida')   urls.push({ url: 'https://catalogo-vpfe.dian.gov.co/NominaDocument/Emitted',  grp: 'NominaEmitida' });
-      if (!grupo || grupo === 'NominaRecibida')  urls.push({ url: 'https://catalogo-vpfe.dian.gov.co/NominaDocument/Received', grp: 'NominaRecibida' });
-
-      for (const dest of urls) {
-        const filas = await obtenerCUFEsViaAjax(page, dest.url, startDate, endDate, rango.desde, rango.hasta);
-        console.log('[DIAN] ' + dest.grp + ' ' + rango.desde + ': ' + filas.length + ' CUFEs');
-        filas.forEach(function(f) {
-          if (!seenCUFEs[f.cufe]) {
-            seenCUFEs[f.cufe] = true;
-            const cells = f.cells || [];
-            // Usar campos pre-parseados si existen (vienen de parsearFilasAjax)
-            todosDocumentos.push({
-              cufe: f.cufe,
-              cufeUrl: 'https://catalogo-vpfe.dian.gov.co/document/searchqr?documentkey=' + f.cufe,
-              tipo:        f.tipo        || cells[0] || 'Factura electronica',
-              fecha:       f.fecha       || cells[7] || cells[2] || '',
-              prefijo:     f.prefijo     || cells[3] || '',
-              folio:       f.folio       || cells[4] || cells[2] || '',
-              nitEmisor:   f.nitEmisor   || cells[9] || '',
-              nomEmisor:   f.nomEmisor   || cells[10] || '',
-              nitReceptor: f.nitReceptor || cells[11] || nit,
-              nomReceptor: f.nomReceptor || cells[12] || '',
-              nombre:      f.nombre      || ((cells[3]||'') ? (cells[3]+'-') : '') + (cells[4]||cells[2]||''),
-              total:       f.total       || 0,
-              estado:      f.estado      || '',
-              grupo: dest.grp,
-              rangoDesde: rango.desde, rangoHasta: rango.hasta,
-            });
-          }
-        });
-      }
+      if (fac.pdfBuffer) folder.file(baseName + '.pdf', fac.pdfBuffer);
+      if (fac.xmlBuffer) folder.file(baseName + '.xml', fac.xmlBuffer);
+      else if (fac.xmlText) folder.file(baseName + '.xml', fac.xmlText);
     }
 
-    console.log('[DIAN] TOTAL CUFEs: ' + todosDocumentos.length);
+    const zipBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    const emp = empresa.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 20);
+    const fi  = (fechaInicio || '').replace(/-/g, '');
+    const ff  = (fechaFin    || '').replace(/-/g, '');
+    const zipName = emp + '_' + fi + '_' + ff + '.zip';
 
-    // FASE 2: Descargar por grupo+rango, recargando la pagina para cada pagina de DataTables
-    const documentos = [];
-    const descargadosCUFE = {};
-
-    // Agrupar por grupo+rango
-    const grupos = {};
-    todosDocumentos.forEach(function(doc) {
-      const key = doc.grupo + '|' + doc.rangoDesde + '|' + doc.rangoHasta;
-      if (!grupos[key]) grupos[key] = { docs: [], grp: doc.grupo, desde: doc.rangoDesde, hasta: doc.rangoHasta };
-      grupos[key].docs.push(doc);
-    });
-
-    for (const gKey of Object.keys(grupos)) {
-      const g = grupos[gKey];
-      const pUrl = g.grp === 'Emitido'        ? 'https://catalogo-vpfe.dian.gov.co/Document/Sent' :
-                   g.grp === 'NominaEmitida'  ? 'https://catalogo-vpfe.dian.gov.co/NominaDocument/Emitted' :
-                   g.grp === 'NominaRecibida' ? 'https://catalogo-vpfe.dian.gov.co/NominaDocument/Received' :
-                   'https://catalogo-vpfe.dian.gov.co/Document/Received';
-      console.log('[DIAN] Descargando grupo ' + g.grp + ' ' + g.desde + ': ' + g.docs.length + ' docs');
-      global._edianTotal = (global._edianTotal || 0) + g.docs.length;
-      if (!global._edianDescargados) global._edianDescargados = 0;
-
-      const cufeMap = {};
-      g.docs.forEach(function(d) { cufeMap[d.cufe] = d; });
-
-      const startD = toFechaDIAN(g.desde);
-      const endD   = toFechaDIAN(g.hasta);
-
-      // Para cada pagina de DataTables, recargamos la pagina y navegamos a esa pagina
-      // Esto evita que el estado se pierda despues de cada descarga
-      let paginaActual = 1;
-      let totalPaginas = Math.ceil(g.docs.length / 10);
-      let totalDescargadosGrupo = 0;
-
-      // Cargar pagina, click primer boton para descubrir URL, luego usar URL directa
-      await buscarYNavegar(page, pUrl, startD, endD, g.desde, g.hasta);
-
-      // Obtener primer CUFE visible para descubrir la URL de descarga
-      const primerosCUFEs = await page.evaluate(function() {
-        var cufes = [];
-        document.querySelectorAll('button.download-document, button[data-id]').forEach(function(btn) {
-          var c = btn.getAttribute('data-id') || btn.id;
-          if (c && c.length > 20) cufes.push(c);
-        });
-        return cufes;
-      });
-
-      let urlDescargaInfo = null;
-      console.log('[DIAN] primerosCUFEs visibles: ' + primerosCUFEs.length + ' en pagina ' + pUrl);
-      const primerCufeDescargable = primerosCUFEs.find(function(c){ return cufeMap[c] && !descargadosCUFE[c]; });
-      console.log('[DIAN] primerCufeDescargable: ' + (primerCufeDescargable ? primerCufeDescargable.substring(0,20) : 'NINGUNO'));
-
-      if (primerCufeDescargable) {
-        console.log('[DIAN] Descubriendo URL de descarga con ' + cufeMap[primerCufeDescargable].nombre + '...');
-        urlDescargaInfo = await encontrarUrlDescarga(page, primerCufeDescargable);
-        // Marcar como descargado (ya lo bajamos en el proceso de descubrir)
-        const doc = cufeMap[primerCufeDescargable];
-        // Re-descargar via click normal para obtener el buffer
-        const archivos = await descargarDocumentoClick(page, primerCufeDescargable);
-        descargadosCUFE[primerCufeDescargable] = true;
-        totalDescargadosGrupo++;
-        documentos.push({ ...doc, pdfBuffer: archivos?.pdfBuffer||null, xmlBuffer: archivos?.xmlBuffer||null, xmlText: archivos?.xmlText||'' });
-        global._edianDescargados = (global._edianDescargados||0) + 1;
-        console.log('[PROGRESS] ' + global._edianDescargados + '/' + (global._edianTotal||'?'));
-      }
-
-      // Si tenemos URL de descarga, usarla directamente para TODOS los demas
-      if (urlDescargaInfo) {
-        const restantes = g.docs.filter(function(d){ return !descargadosCUFE[d.cufe]; });
-        console.log('[DIAN] ' + (soloXML ? 'MODO RÁPIDO XML' : 'descarga completa') + ': ' + restantes.length + ' docs restantes');
-
-        if (soloXML) {
-          // MODO RÁPIDO: descargar XMLs en paralelo (5 a la vez)
-          const { descargarXMLsParalelo } = require('./dianScraper');
-          const rapidos = await descargarXMLsParalelo(page, restantes, urlDescargaInfo, descargadosCUFE, function() {
-            global._edianDescargados = (global._edianDescargados||0) + 1;
-            emitProgreso && emitProgreso({ fase:'descargando', n: global._edianDescargados, total: global._edianTotal||0 });
-          });
-          rapidos.forEach(function(r){ documentos.push(r); });
-        } else {
-        // MODO COMPLETO: descargar PDFs+XMLs uno a uno
-        for (const doc of g.docs) {
-          if (descargadosCUFE[doc.cufe]) continue;
-          console.log('  [DL URL] ' + doc.nombre);
-          const archivos = await descargarViaUrl(page, doc.cufe, urlDescargaInfo);
-          descargadosCUFE[doc.cufe] = true;
-          totalDescargadosGrupo++;
-          documentos.push({ ...doc, pdfBuffer: archivos?.pdfBuffer||null, xmlBuffer: archivos?.xmlBuffer||null, xmlText: archivos?.xmlText||'' });
-          global._edianDescargados = (global._edianDescargados||0) + 1;
-        }
-        } // end modo completo
-        console.log('[DIAN] Grupo ' + g.grp + ' (URL directa): ' + totalDescargadosGrupo + '/' + g.docs.length);
-      } else {
-        console.log('[DIAN] URL no encontrada, usando paginacion...');
-      // Fallback: paginacion
-      for (let pg = 1; pg <= totalPaginas + 2; pg++) {
-        // Siempre recargar con fechas antes de cada pagina
-        // Esto evita que los AJAX de las descargas reseteen el filtro
-        await buscarYNavegar(page, pUrl, startD, endD, g.desde, g.hasta);
-
-        // Navegar a la pagina correcta del DataTables
-        for (let salto = 1; salto < pg; salto++) {
-          // Esperar que el boton Next este disponible
-          await page.waitForFunction(function() {
-            var n = document.querySelector(
-              '#tbl-documents_next:not(.disabled), ' +
-              'li.paginate_button.next:not(.disabled) a, ' +
-              '.paginate_button.next:not(.disabled)'
-            );
-            return !!n;
-          }, { timeout: 8000 }).catch(function(){});
-
-          const ok = await page.evaluate(function() {
-            var n = document.querySelector(
-              '#tbl-documents_next:not(.disabled), ' +
-              'li.paginate_button.next:not(.disabled) a, ' +
-              '.paginate_button.next:not(.disabled)'
-            );
-            if (n) { n.click(); return true; }
-            // Debug: show what pagination buttons exist
-            var allPag = Array.from(document.querySelectorAll('.paginate_button, [id*="next"]')).map(function(el){
-              return el.id + '/' + el.className.substring(0,40);
-            });
-            console.log('Paginacion disponible:', allPag.join(' | '));
-            return false;
-          });
-          if (!ok) { pg = 9999; break; }
-          // Esperar que los nuevos botones carguen
-          await page.waitForTimeout(150);
-          await page.waitForFunction(function() {
-            return document.querySelectorAll('button.download-document, button[data-id]').length > 0;
-          }, { timeout: 8000 }).catch(function(){});
-          await page.waitForTimeout(150);
-        }
-        if (pg > totalPaginas + 2) break;
-
-        // Obtener CUFEs visibles
-        const cufesVisibles = await page.evaluate(function() {
-          var cufes = [];
-          document.querySelectorAll('button.download-document, button[data-id]').forEach(function(btn) {
-            var cufe = btn.getAttribute('data-id') || btn.id;
-            if (cufe && cufe.length > 20) cufes.push(cufe);
-          });
-          return cufes;
-        });
-
-        console.log('[DIAN] Pag ' + pg + '/' + totalPaginas + ': ' + cufesVisibles.length + ' botones');
-        if (cufesVisibles.length === 0) break;
-
-        // Descargar todos sin recargar entre ellos
-        let descargadosEnPagina = 0;
-        for (const cufe of cufesVisibles) {
-          if (!cufeMap[cufe] || descargadosCUFE[cufe]) continue;
-          const doc = cufeMap[cufe];
-          console.log('  [DL] ' + doc.nombre);
-          const archivos = await descargarDocumentoClick(page, cufe);
-          descargadosCUFE[cufe] = true;
-          descargadosEnPagina++;
-          totalDescargadosGrupo++;
-          documentos.push({
-            ...doc,
-            pdfBuffer: archivos?.pdfBuffer || null,
-            xmlBuffer: archivos?.xmlBuffer || null,
-            xmlText:   archivos?.xmlText   || '',
-          });
-        }
-        console.log('[DIAN] Pag ' + pg + ': +' + descargadosEnPagina + ' | total: ' + totalDescargadosGrupo + '/' + g.docs.length);
-        if (totalDescargadosGrupo >= g.docs.length) break;
-        if (descargadosEnPagina === 0) break;
-      } // end for pg
-      } // end if !urlDescargaInfo
-
-      console.log('[DIAN] Grupo ' + g.grp + ': ' + totalDescargadosGrupo + '/' + g.docs.length);
-    }
-
-    // Incluir los sin descarga
-    todosDocumentos.forEach(function(doc) {
-      if (!descargadosCUFE[doc.cufe]) {
-        console.log('[DIAN] Sin descarga: ' + doc.nombre);
-        documentos.push({ ...doc, pdfBuffer: null, xmlBuffer: null, xmlText: '' });
-      }
-    });
-
-    console.log('[DIAN] Completado: ' + documentos.length + '/' + todosDocumentos.length);
-    return { documentos, nit, total: documentos.length, filasEncontradas: todosDocumentos.length };
-
-  } finally {
-    await browser.close();
+    res.setHeader('Content-Disposition', 'attachment; filename="' + zipName + '"');
+    res.setHeader('Content-Type', 'application/zip');
+    res.send(zipBuffer);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-}
+});
 
-async function diagnosticarPortal(tokenUrl) {
-  const { nit, token, pk } = parseTokenUrl(tokenUrl);
-  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage'] });
-  const context = await browser.newContext({ userAgent: 'Mozilla/5.0 Chrome/120' });
-  const page = await context.newPage();
-  try {
-    await autenticar(context, page, pk, nit, token);
-    await page.goto('https://catalogo-vpfe.dian.gov.co/Document/Received', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    const info = await page.evaluate(function() {
-      return { url: window.location.href, titulo: document.title,
-        inputs: Array.from(document.querySelectorAll('input,select')).map(function(el) {
-          return { id: el.id, name: el.name, type: el.type, value: el.value.substring(0,80) };
-        }), html: document.body.innerHTML.substring(0, 5000) };
-    });
-    return { ok: true, nit, ...info };
-  } finally { await browser.close(); }
-}
-
-module.exports = { descargarDIAN, diagnosticarPortal, parseTokenUrl };
-
-// ── MODO RÁPIDO: solo XMLs sin PDFs ───────────────────────────────────────────
-// Usa fetch directo con cookies de sesión del browser, sin clicks
-// 3-5x más rápido que el modo completo
-async function descargarSoloXMLs(page, cufe, urlInfo) {
-  try {
-    // Si tenemos URL de descarga directa, usarla con fetch paralelo
-    if (urlInfo && urlInfo.url) {
-      let url = urlInfo.url;
-      let body = urlInfo.bodyTemplate;
-      if (body) {
-        body = body.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
-        body = body.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
-        body = body.replace(/id=[^&]+/, 'id=' + encodeURIComponent(cufe));
-        body = body.replace(/[0-9a-f]{64,}/, cufe);
-      }
-      if (urlInfo.method === 'GET') {
-        url = url.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
-        url = url.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
-      }
-
-      // Fetch directo desde el browser (usa cookies de sesión)
-      const result = await page.evaluate(async function(params) {
-        try {
-          const resp = await fetch(params.url, {
-            method: params.method || 'GET',
-            headers: params.body ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {},
-            body: params.body || undefined,
-            credentials: 'include',
-          });
-          if (!resp.ok) return { error: 'HTTP ' + resp.status };
-          const arrayBuf = await resp.arrayBuffer();
-          // Convert to base64 for transfer
-          const bytes = new Uint8Array(arrayBuf);
-          let binary = '';
-          bytes.forEach(function(b) { binary += String.fromCharCode(b); });
-          return { ok: true, base64: btoa(binary), contentType: resp.headers.get('content-type') || '' };
-        } catch(e) { return { error: e.message }; }
-      }, { url, method: urlInfo.method, body: body || null });
-
-      if (result && result.ok && result.base64) {
-        const buffer = Buffer.from(result.base64, 'base64');
-        // Extract XML from ZIP
-        let xmlText = '', xmlBuffer = null;
-        try {
-          const JSZip2 = require('jszip');
-          const zip = await JSZip2.loadAsync(buffer);
-          for (const [fn, file] of Object.entries(zip.files)) {
-            if (fn.toLowerCase().endsWith('.xml')) {
-              xmlBuffer = await file.async('nodebuffer');
-              xmlText = xmlBuffer.toString('utf8');
-              break;
-            }
-          }
-        } catch(e) {
-          // Maybe it IS the xml directly
-          xmlText = buffer.toString('utf8');
-          if (xmlText.includes('<?xml') || xmlText.includes('<Invoice')) {
-            xmlBuffer = buffer;
-          }
-        }
-        return { pdfBuffer: null, xmlBuffer, xmlText };
-      }
-    }
-    return { pdfBuffer: null, xmlBuffer: null, xmlText: '' };
-  } catch(e) {
-    console.error('[XML FAST]', e.message.substring(0,80));
-    return { pdfBuffer: null, xmlBuffer: null, xmlText: '' };
-  }
-}
-
-// Descarga XMLs en lotes paralelos (5 a la vez)
-async function descargarXMLsParalelo(page, docs, urlInfo, descargadosCUFE, onProgress) {
-  const BATCH = 5;
-  const resultados = [];
-  for (let i = 0; i < docs.length; i += BATCH) {
-    const lote = docs.slice(i, i + BATCH);
-    const promesas = lote.map(async function(doc) {
-      if (descargadosCUFE[doc.cufe]) return null;
-      const archivos = await descargarSoloXMLs(page, doc.cufe, urlInfo);
-      descargadosCUFE[doc.cufe] = true;
-      if (onProgress) onProgress();
-      return { ...doc, pdfBuffer: null, xmlBuffer: archivos.xmlBuffer, xmlText: archivos.xmlText };
-    });
-    const loteRes = await Promise.all(promesas);
-    loteRes.forEach(function(r) { if (r) resultados.push(r); });
-  }
-  return resultados;
-}
-
-module.exports.descargarXMLsParalelo = descargarXMLsParalelo;
+module.exports = router;
