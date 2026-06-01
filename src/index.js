@@ -5,6 +5,8 @@ const dianRoutes  = require('./routes/dian');
 const fase2Routes = require('./routes/fase2');
 const authRoutes  = require('./routes/auth');
 const boldRoutes  = require('./routes/bold');
+const nitRoutes = require('./routes/nit');
+app.use('/api/nit', nitRoutes);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
