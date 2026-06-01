@@ -1,14 +1,12 @@
 require('dotenv').config();
-const express = require('express');
-
+const express    = require('express');
 const dianRoutes  = require('./routes/dian');
 const fase2Routes = require('./routes/fase2');
 const authRoutes  = require('./routes/auth');
 const boldRoutes  = require('./routes/bold');
-const nitRoutes = require('./routes/nit');
-app.use('/api/nit', nitRoutes);
+const nitRoutes   = require('./routes/nit');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3001;
 
 // ── Middleware ──────────────────────────────────────────────
@@ -30,6 +28,7 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Credentials', 'true');
   next();
 });
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -52,6 +51,7 @@ app.use('/api/dian',  dianRoutes);
 app.use('/api/fase2', fase2Routes);
 app.use('/api/auth',  authRoutes);
 app.use('/api/bold',  boldRoutes);
+app.use('/api/nit',   nitRoutes);
 
 // ── Error handler ───────────────────────────────────────────
 app.use((err, req, res, next) => {
