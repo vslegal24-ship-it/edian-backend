@@ -2,6 +2,24 @@ const { chromium } = require('playwright');
 const JSZip = require('jszip');
 const fs = require('fs');
 
+// Helper: ejecuta page.evaluate con retry si el contexto se destruye
+async function safeEval(page, fn, args, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await page.evaluate(fn, args);
+    } catch(e) {
+      if (e.message && e.message.includes('Execution context was destroyed')) {
+        console.log('[safeEval] Contexto destruido, esperando... intento ' + (i+1));
+        await page.waitForTimeout(1500);
+        await page.waitForLoadState('domcontentloaded').catch(function(){});
+      } else {
+        throw e;
+      }
+    }
+  }
+  return null;
+}
+
 function parseTokenUrl(url) {
   try {
     const u = new URL(url.trim());
@@ -102,7 +120,7 @@ async function obtenerCUFEsViaAjax(page, url, startDate, endDate, startISO, endI
       nuevoPayload = nuevoPayload.replace(/length=-?\d+/, 'length=10000').replace(/length%3D-?\d+/, 'length%3D10000');
       if (!nuevoPayload.includes('length')) nuevoPayload += '&length=10000&start=0';
 
-      const respAll = await page.evaluate(async function(params) {
+      const respAll = await safeEval(page, async function(params) {
         try {
           var resp = await fetch(params.url, {
             method: 'POST',
@@ -269,7 +287,7 @@ async function descargarViaUrl(page, cufe, urlInfo) {
       url = url.replace(/id=[^&]+/, 'id=' + encodeURIComponent(cufe));
       url = url.replace(/[0-9a-f]{64,}/, cufe);
     }
-    const resultado = await page.evaluate(async function(params) {
+    const resultado = await safeEval(page, async function(params) {
       try {
         var resp;
         if (params.method === 'GET') { resp = await fetch(params.url, { credentials: 'include' }); }
