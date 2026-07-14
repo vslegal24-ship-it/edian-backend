@@ -60,8 +60,12 @@ app.use((err, req, res, next) => {
 });
 
 // ── Start ───────────────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ EDIAN Backend corriendo en puerto ${PORT}`);
 });
+
+// Timeout extendido para procesos largos (10 minutos)
+server.timeout = 600000;
+server.keepAliveTimeout = 620000;
 
 module.exports = app;
