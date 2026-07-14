@@ -32,14 +32,11 @@ function dividirEnMeses(fechaInicio, fechaFin) {
   return rangos;
 }
 
-/**
- * Autentica y retorna la pagina con sesion activa.
- */
 async function autenticar(context, page, pk, nit, token) {
   console.log('[DIAN] Autenticando NIT ' + nit);
   await page.goto(
     'https://catalogo-vpfe.dian.gov.co/User/AuthToken?pk=' + pk + '&rk=' + nit + '&token=' + token,
-    { waitUntil: 'networkidle', timeout: 40000 }
+    { waitUntil: 'domcontentloaded', timeout: 40000 }
   );
   if (page.url().includes('login') || page.url().includes('Login')) {
     throw new Error('Token invalido o expirado. Solicita un nuevo token en la DIAN.');
@@ -47,16 +44,10 @@ async function autenticar(context, page, pk, nit, token) {
   console.log('[DIAN] Autenticado OK — URL: ' + page.url());
 }
 
-/**
- * Obtiene TODOS los CUFEs interceptando la llamada AJAX de DataTables.
- * Cuando el portal hace la busqueda, interceptamos la peticion y la
- * repetimos con length=10000 para traer todos los registros.
- */
 async function obtenerCUFEsViaAjax(page, url, startDate, endDate, startISO, endISO) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   console.log('[DIAN] Pagina cargada: ' + page.url());
 
-  // Inyectar fechas
   await page.evaluate(function(p) {
     var sEl = document.getElementById('startDate'); if (sEl) sEl.value = p.start;
     var eEl = document.getElementById('endDate');   if (eEl) eEl.value = p.end;
@@ -70,28 +61,19 @@ async function obtenerCUFEsViaAjax(page, url, startDate, endDate, startISO, endI
     }
   }, { start: startDate, end: endDate, startISO, endISO });
 
-  // Configurar interceptor ANTES de hacer busqueda
-  let ajaxUrl = null;
-  let ajaxPayload = null;
-  let ajaxHeaders = {};
-
+  let ajaxUrl = null, ajaxPayload = null, ajaxHeaders = {};
   page.on('request', function(req) {
-    const u = req.url();
-    const m = req.method();
+    const u = req.url(), m = req.method();
     if (m === 'POST' && (u.includes('GetDocuments') || u.includes('datatables') || u.includes('DataTable') || u.includes('ajax'))) {
-      ajaxUrl = u;
-      ajaxPayload = req.postData();
-      ajaxHeaders = req.headers();
+      ajaxUrl = u; ajaxPayload = req.postData(); ajaxHeaders = req.headers();
       console.log('[AJAX] Interceptado: ' + u);
     }
   });
 
-  // Tambien interceptar respuestas para capturar la URL del DataTable
   const respuestasCapturadas = [];
   page.on('response', async function(resp) {
     try {
-      const u = resp.url();
-      const ct = resp.headers()['content-type'] || '';
+      const u = resp.url(), ct = resp.headers()['content-type'] || '';
       if (ct.includes('json') && u.includes('catalogo-vpfe.dian.gov.co') && resp.status() === 200) {
         const body = await resp.text();
         if (body.includes('"data"') || body.includes('"recordsTotal"') || body.includes('"cufe"') || body.includes('"Cufe"')) {
@@ -102,25 +84,20 @@ async function obtenerCUFEsViaAjax(page, url, startDate, endDate, startISO, endI
     } catch(e) {}
   });
 
-  // Hacer busqueda
   await page.evaluate(function() {
     var b = Array.from(document.querySelectorAll('button, input[type=submit]')).find(function(x) {
       return (x.textContent + (x.value||'')).toLowerCase().includes('buscar');
     });
-    if (b) b.click();
-    else { var f = document.querySelector('form'); if (f) f.submit(); }
+    if (b) b.click(); else { var f = document.querySelector('form'); if (f) f.submit(); }
   });
 
   await page.waitForTimeout(200);
   await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(function(){});
 
   console.log('[DIAN] AJAX URL interceptada:', ajaxUrl);
-  console.log('[DIAN] Respuestas JSON capturadas:', respuestasCapturadas.length);
 
-  // Si capturamos el AJAX, repetirlo con length=10000
   if (ajaxUrl) {
     try {
-      // Modificar el payload para traer todos los registros
       let nuevoPayload = ajaxPayload || '';
       nuevoPayload = nuevoPayload.replace(/length=-?\d+/, 'length=10000').replace(/length%3D-?\d+/, 'length%3D10000');
       if (!nuevoPayload.includes('length')) nuevoPayload += '&length=10000&start=0';
@@ -149,29 +126,15 @@ async function obtenerCUFEsViaAjax(page, url, startDate, endDate, startISO, endI
       console.log('[DIAN] Error repitiendo AJAX:', e.message);
     }
   }
-
-  // Fallback: extraer de la UI con DataTables API
   return await extraerViaDataTables(page);
 }
 
-/**
- * Parsea las filas que vienen del AJAX de la DIAN.
- * Los campos pueden venir en diferentes formatos.
- */
 function parsearFilasAjax(rows) {
-  // Log first row to see all available fields
   if (rows.length > 0) console.log('[AJAX] Campos disponibles:', Object.keys(rows[0]).join(', '));
-
   const resultado = [];
   rows.forEach(function(r) {
-    // El CUFE viene en el campo "Id" segun la DIAN
     const cufe = r.Id || r.id || r.cufe || r.Cufe || r.CUFE || r.documentKey || r.DocumentKey || r.uuid || r.UUID || '';
     if (!cufe || cufe.length < 20) return;
-
-    // Extraer todos los campos disponibles
-    // Campos DIAN conocidos del JSON: Id, FechaEmision, FechaRecepcion, Prefijo, NumeroDocumento,
-    // TipoDocumento, NitEmisor, NombreEmisor, NitReceptor, NombreReceptor, Total, Estado
-    // Campos reales del JSON de la DIAN (confirmados via log)
     const folio   = r.Number   || r.NumeroDocumento || '';
     const prefijo = r.Serie    || r.Prefijo || '';
     const fecha   = r.EmissionDate || r.ReceptionDate || '';
@@ -184,13 +147,10 @@ function parsearFilasAjax(rows) {
     const iva     = r.TaxAmountIva || 0;
     const estado  = r.StatusName   || '';
     const nombre  = (prefijo ? prefijo + '-' : '') + folio;
-
     resultado.push({
-      cufe: String(cufe),
-      cells: [tipo, String(cufe), folio, prefijo, '', '', '', fecha, '', nitEmi, nomEmi, nitRec, nomRec],
+      cufe: String(cufe), cells: [tipo, String(cufe), folio, prefijo, '', '', '', fecha, '', nitEmi, nomEmi, nitRec, nomRec],
       tipo, fecha, prefijo, folio, nombre,
-      nitEmisor: nitEmi, nomEmisor: nomEmi,
-      nitReceptor: nitRec, nomReceptor: nomRec,
+      nitEmisor: nitEmi, nomEmisor: nomEmi, nitReceptor: nitRec, nomReceptor: nomRec,
       total, iva, estado,
     });
   });
@@ -198,49 +158,26 @@ function parsearFilasAjax(rows) {
   return resultado;
 }
 
-/**
- * Fallback: usar la API de DataTables para cambiar page length a -1 (todos).
- */
 async function extraerViaDataTables(page) {
   const resultado = await page.evaluate(function() {
     var filas = [];
-
-    // Intentar DataTables API
     try {
       if (window.$ && $.fn.DataTable) {
-        var tables = $.fn.DataTable.tables({ api: true });
-        if (!tables || !tables.rows) {
-          // Otra forma de obtener instancias
-          var tbl = $('table.dataTable').first();
-          if (tbl.length) {
-            var dt = tbl.DataTable();
-            // Cambiar a mostrar todo
-            dt.page.len(-1).draw(false);
-            // Esperar el redibujado (no podemos hacer await aqui)
-          }
-        }
+        var tbl = $('table.dataTable').first();
+        if (tbl.length) { var dt = tbl.DataTable(); dt.page.len(-1).draw(false); }
       }
     } catch(e) {}
-
-    // Extraer filas visibles + ocultas (DataTables guarda todo en el DOM)
     var seenCUFEs = {};
     var rows = document.querySelectorAll('table tbody tr');
     rows.forEach(function(tr) {
       if (tr.style.display === 'none' && !tr.className.includes('child')) return;
-      var cells = Array.from(tr.querySelectorAll('td')).map(function(td) {
-        return td.textContent.trim().replace(/\s+/g, ' ');
-      });
+      var cells = Array.from(tr.querySelectorAll('td')).map(function(td) { return td.textContent.trim().replace(/\s+/g, ' '); });
       var btn = tr.querySelector('button.download-document, button[data-id]');
       var cufe = btn ? (btn.getAttribute('data-id') || btn.id || '') : '';
-      if (cells.length > 2 && cufe && !seenCUFEs[cufe]) {
-        seenCUFEs[cufe] = true;
-        filas.push({ cells: cells, cufe: cufe });
-      }
+      if (cells.length > 2 && cufe && !seenCUFEs[cufe]) { seenCUFEs[cufe] = true; filas.push({ cells: cells, cufe: cufe }); }
     });
     return filas;
   });
-
-  // Si solo tenemos la primera pagina, paginar manualmente
   if (resultado.length <= 10) {
     console.log('[DIAN] Solo ' + resultado.length + ' filas visibles, paginando...');
     return await paginarManual(page, resultado);
@@ -253,25 +190,18 @@ async function paginarManual(page, filasIniciales) {
   const seenCUFEs = {};
   todos.forEach(function(f) { seenCUFEs[f.cufe] = true; });
   let pg = 2;
-
   while (pg <= 30) {
     const clicado = await page.evaluate(function(pgNum) {
-      // Intentar por numero de pagina
       var links = document.querySelectorAll('.paginate_button:not(.previous):not(.next):not(.first):not(.last)');
       for (var i = 0; i < links.length; i++) {
-        if (links[i].textContent.trim() === String(pgNum) && !links[i].classList.contains('active')) {
-          links[i].click(); return 'pg-' + pgNum;
-        }
+        if (links[i].textContent.trim() === String(pgNum) && !links[i].classList.contains('active')) { links[i].click(); return 'pg-' + pgNum; }
       }
-      // Intentar "Siguiente"
       var next = document.querySelector('#tbl-documents_next:not(.disabled), a.next:not(.disabled), li.next:not(.disabled) a');
       if (next) { next.click(); return 'next'; }
       return null;
     }, pg);
-
     if (!clicado) break;
     await page.waitForTimeout(300);
-
     const nuevas = await page.evaluate(function(seen) {
       var filas = [];
       document.querySelectorAll('table tbody tr').forEach(function(tr) {
@@ -284,7 +214,6 @@ async function paginarManual(page, filasIniciales) {
       var isLast = !document.querySelector('#tbl-documents_next:not(.disabled), .paginate_button.next:not(.disabled)');
       return { filas: filas, isLast: isLast };
     }, seenCUFEs);
-
     console.log('[DIAN] Pag ' + pg + ': ' + nuevas.filas.length + ' nuevas | total: ' + (todos.length + nuevas.filas.length));
     nuevas.filas.forEach(function(f) { seenCUFEs[f.cufe] = true; todos.push(f); });
     if (nuevas.isLast || nuevas.filas.length === 0) break;
@@ -293,51 +222,30 @@ async function paginarManual(page, filasIniciales) {
   return todos;
 }
 
-/**
- * Encuentra el patron de URL de descarga interceptando el primer click.
- * Retorna la funcion de descarga que usa fetch directo.
- */
 async function encontrarUrlDescarga(page, primerCufe) {
-  let downloadUrl = null;
-  let downloadMethod = null;
-  let downloadBody = null;
-
-  // Interceptar requests para encontrar el patron
+  let downloadUrl = null, downloadMethod = null, downloadBody = null;
   const handler = function(req) {
-    const u = req.url();
-    const m = req.method();
+    const u = req.url(), m = req.method();
     if (u.includes('Download') || u.includes('download') || u.includes('GetFile') || u.includes('getfile') || u.includes('Zip') || u.includes('zip')) {
       if (u.includes('dian.gov.co') || u.includes('catalogo')) {
-        downloadUrl = u;
-        downloadMethod = m;
-        downloadBody = req.postData();
+        downloadUrl = u; downloadMethod = m; downloadBody = req.postData();
         console.log('[INTERCEPT DL] ' + m + ' ' + u + (downloadBody ? ' body:'+downloadBody.substring(0,100) : ''));
       }
     }
   };
   page.on('request', handler);
-
-  // Hacer el primer click para capturar la URL
   try {
     await Promise.all([
       page.waitForEvent('download', { timeout: 20000 }),
       page.evaluate(function(id) {
         var el = document.getElementById(id);
-        if (!el) {
-          var btns = document.querySelectorAll('button[data-id]');
-          for (var i = 0; i < btns.length; i++) {
-            if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; }
-          }
-        }
+        if (!el) { var btns = document.querySelectorAll('button[data-id]'); for (var i = 0; i < btns.length; i++) { if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; } } }
         if (el) { el.click(); return true; }
         return false;
       }, primerCufe),
     ]);
-  } catch(e) {
-    console.log('[INTERCEPT DL] Error en primer click:', e.message.substring(0,80));
-  }
+  } catch(e) { console.log('[INTERCEPT DL] Error en primer click:', e.message.substring(0,80)); }
   page.off('request', handler);
-
   if (downloadUrl) {
     console.log('[DIAN] URL de descarga encontrada: ' + downloadMethod + ' ' + downloadUrl);
     return { url: downloadUrl, method: downloadMethod, bodyTemplate: downloadBody };
@@ -345,16 +253,9 @@ async function encontrarUrlDescarga(page, primerCufe) {
   return null;
 }
 
-/**
- * Descarga un documento usando fetch directo con la URL conocida.
- */
 async function descargarViaUrl(page, cufe, urlInfo) {
   try {
-    // Construir la URL con el CUFE del documento
-    let url = urlInfo.url;
-    let body = urlInfo.bodyTemplate;
-
-    // Reemplazar el CUFE del primer documento con el actual
+    let url = urlInfo.url, body = urlInfo.bodyTemplate;
     if (body) {
       body = body.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
       body = body.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
@@ -363,49 +264,33 @@ async function descargarViaUrl(page, cufe, urlInfo) {
       body = body.replace(/[0-9a-f]{64,}/, cufe);
     }
     if (urlInfo.method === 'GET') {
-      // Reemplazar el trackId u otro parametro que contenga el CUFE
       url = url.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
       url = url.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
       url = url.replace(/id=[^&]+/, 'id=' + encodeURIComponent(cufe));
-      // Reemplazar CUFE en el path si aplica
       url = url.replace(/[0-9a-f]{64,}/, cufe);
     }
-
     const resultado = await page.evaluate(async function(params) {
       try {
         var resp;
-        if (params.method === 'GET') {
-          resp = await fetch(params.url, { credentials: 'include' });
-        } else {
-          resp = await fetch(params.url, {
-            method: params.method || 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
-            body: params.body,
-            credentials: 'include',
-          });
-        }
+        if (params.method === 'GET') { resp = await fetch(params.url, { credentials: 'include' }); }
+        else { resp = await fetch(params.url, { method: params.method || 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' }, body: params.body, credentials: 'include' }); }
         if (!resp.ok) return { error: 'HTTP ' + resp.status };
         var arr = await resp.arrayBuffer();
         return { size: arr.byteLength, data: Array.from(new Uint8Array(arr)) };
       } catch(e) { return { error: e.message }; }
     }, { url, method: urlInfo.method, body });
-
     if (resultado.error || !resultado.size) return null;
     const buffer = Buffer.from(resultado.data);
     let pdfBuffer = null, xmlBuffer = null, xmlText = '';
-    const JSZip2 = require('jszip');
     try {
-      const zip = await JSZip2.loadAsync(buffer);
+      const zip = await JSZip.loadAsync(buffer);
       for (const [fn, file] of Object.entries(zip.files)) {
         if (fn.toLowerCase().endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
         if (fn.toLowerCase().endsWith('.xml')) { xmlBuffer = await file.async('nodebuffer'); xmlText = await file.async('text'); }
       }
     } catch(e) {}
     return { pdfBuffer, xmlBuffer, xmlText };
-  } catch(e) {
-    console.error('[DL URL]', e.message.substring(0,80));
-    return null;
-  }
+  } catch(e) { console.error('[DL URL]', e.message.substring(0,80)); return null; }
 }
 
 async function descargarDocumentoClick(page, cufe) {
@@ -414,12 +299,7 @@ async function descargarDocumentoClick(page, cufe) {
       page.waitForEvent('download', { timeout: 25000 }),
       page.evaluate(function(id) {
         var el = document.getElementById(id);
-        if (!el) {
-          var btns = document.querySelectorAll('button[data-id]');
-          for (var i = 0; i < btns.length; i++) {
-            if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; }
-          }
-        }
+        if (!el) { var btns = document.querySelectorAll('button[data-id]'); for (var i = 0; i < btns.length; i++) { if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; } } }
         if (el) { el.click(); return true; }
         return false;
       }, cufe),
@@ -438,10 +318,7 @@ async function descargarDocumentoClick(page, cufe) {
       else if (n.endsWith('.pdf')) pdfBuffer = buffer;
     }
     return { pdfBuffer, xmlBuffer, xmlText };
-  } catch(e) {
-    console.error('  [ERR DL]', e.message.substring(0,80));
-    return null;
-  }
+  } catch(e) { console.error('  [ERR DL]', e.message.substring(0,80)); return null; }
 }
 
 async function buscarYNavegar(page, url, startDate, endDate, startISO, endISO) {
@@ -462,7 +339,6 @@ async function buscarYNavegar(page, url, startDate, endDate, startISO, endISO) {
   });
   await page.waitForTimeout(600);
   await page.waitForLoadState('networkidle',{timeout:10000}).catch(function(){});
-  // Esperar a que el DataTables termine de cargar los resultados
   await page.waitForFunction(function() {
     var btns = document.querySelectorAll('button.download-document, button[data-id]');
     return btns.length > 0;
@@ -470,12 +346,102 @@ async function buscarYNavegar(page, url, startDate, endDate, startISO, endISO) {
   await page.waitForTimeout(150);
 }
 
+// ── MODO RÁPIDO: XMLs en paralelo sin PDFs ────────────────────
+async function descargarSoloXMLs(page, cufe, urlInfo) {
+  try {
+    if (urlInfo && urlInfo.url) {
+      let url = urlInfo.url, body = urlInfo.bodyTemplate;
+      if (body) {
+        body = body.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
+        body = body.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
+        body = body.replace(/id=[^&]+/, 'id=' + encodeURIComponent(cufe));
+        body = body.replace(/[0-9a-f]{64,}/, cufe);
+      }
+      if (urlInfo.method === 'GET') {
+        url = url.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
+        url = url.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
+      }
+
+      // Retry hasta 3 veces si el contexto se destruye
+      let result = null;
+      for (let intento = 0; intento < 3; intento++) {
+        try {
+          result = await page.evaluate(async function(params) {
+            try {
+              const resp = await fetch(params.url, {
+                method: params.method || 'GET',
+                headers: params.body ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {},
+                body: params.body || undefined,
+                credentials: 'include',
+              });
+              if (!resp.ok) return { error: 'HTTP ' + resp.status };
+              const arrayBuf = await resp.arrayBuffer();
+              const bytes = new Uint8Array(arrayBuf);
+              let binary = '';
+              bytes.forEach(function(b) { binary += String.fromCharCode(b); });
+              return { ok: true, base64: btoa(binary), contentType: resp.headers.get('content-type') || '' };
+            } catch(e) { return { error: e.message }; }
+          }, { url, method: urlInfo.method, body: body || null });
+          break;
+        } catch(evalErr) {
+          if (evalErr.message && evalErr.message.includes('Execution context was destroyed')) {
+            console.log('[XML FAST] Contexto destruido, reintentando... ' + (intento+1));
+            await page.waitForTimeout(1500);
+            await page.waitForLoadState('domcontentloaded').catch(function(){});
+          } else { throw evalErr; }
+        }
+      }
+
+      if (result && result.ok && result.base64) {
+        const buffer = Buffer.from(result.base64, 'base64');
+        let xmlText = '', xmlBuffer = null;
+        try {
+          const zip = await JSZip.loadAsync(buffer);
+          for (const [fn, file] of Object.entries(zip.files)) {
+            if (fn.toLowerCase().endsWith('.xml')) {
+              xmlBuffer = await file.async('nodebuffer');
+              xmlText = xmlBuffer.toString('utf8');
+              break;
+            }
+          }
+        } catch(e) {
+          xmlText = buffer.toString('utf8');
+          if (xmlText.includes('<?xml') || xmlText.includes('<Invoice')) xmlBuffer = buffer;
+        }
+        return { pdfBuffer: null, xmlBuffer, xmlText };
+      }
+    }
+    return { pdfBuffer: null, xmlBuffer: null, xmlText: '' };
+  } catch(e) {
+    console.error('[XML FAST]', e.message.substring(0,80));
+    return { pdfBuffer: null, xmlBuffer: null, xmlText: '' };
+  }
+}
+
+async function descargarXMLsParalelo(page, docs, urlInfo, descargadosCUFE, onProgress) {
+  const BATCH = 5;
+  const resultados = [];
+  for (let i = 0; i < docs.length; i += BATCH) {
+    const lote = docs.slice(i, i + BATCH);
+    const promesas = lote.map(async function(doc) {
+      if (descargadosCUFE[doc.cufe]) return null;
+      const archivos = await descargarSoloXMLs(page, doc.cufe, urlInfo);
+      descargadosCUFE[doc.cufe] = true;
+      if (onProgress) onProgress();
+      return { ...doc, pdfBuffer: null, xmlBuffer: archivos.xmlBuffer, xmlText: archivos.xmlText };
+    });
+    const loteRes = await Promise.all(promesas);
+    loteRes.forEach(function(r) { if (r) resultados.push(r); });
+  }
+  return resultados;
+}
+
 // ── FUNCION PRINCIPAL ──────────────────────────────────────────
 async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa, soloXML = false }) {
   const { nit, token, pk } = parseTokenUrl(tokenUrl);
   const dias = Math.round((new Date(fechaFin+'T00:00:00') - new Date(fechaInicio+'T00:00:00')) / 86400000);
   const rangos = dias > 31 ? dividirEnMeses(fechaInicio, fechaFin) : [{ desde: fechaInicio, hasta: fechaFin }];
-  console.log('[DIAN] Rangos:', rangos.length, '| Dias:', dias);
+  console.log('[DIAN] Rangos:', rangos.length, '| Dias:', dias, '| soloXML:', soloXML);
 
   const browser = await chromium.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu'] });
   const context = await browser.newContext({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36', acceptDownloads: true });
@@ -506,7 +472,6 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa, 
           if (!seenCUFEs[f.cufe]) {
             seenCUFEs[f.cufe] = true;
             const cells = f.cells || [];
-            // Usar campos pre-parseados si existen (vienen de parsearFilasAjax)
             todosDocumentos.push({
               cufe: f.cufe,
               cufeUrl: 'https://catalogo-vpfe.dian.gov.co/document/searchqr?documentkey=' + f.cufe,
@@ -529,13 +494,14 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa, 
       }
     }
 
+    global._edianTotal = todosDocumentos.length;
+    global._edianDescargados = 0;
     console.log('[DIAN] TOTAL CUFEs: ' + todosDocumentos.length);
 
-    // FASE 2: Descargar por grupo+rango, recargando la pagina para cada pagina de DataTables
+    // FASE 2: Descargar
     const documentos = [];
     const descargadosCUFE = {};
 
-    // Agrupar por grupo+rango
     const grupos = {};
     todosDocumentos.forEach(function(doc) {
       const key = doc.grupo + '|' + doc.rangoDesde + '|' + doc.rangoHasta;
@@ -549,26 +515,19 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa, 
                    g.grp === 'NominaEmitida'  ? 'https://catalogo-vpfe.dian.gov.co/NominaDocument/Emitted' :
                    g.grp === 'NominaRecibida' ? 'https://catalogo-vpfe.dian.gov.co/NominaDocument/Received' :
                    'https://catalogo-vpfe.dian.gov.co/Document/Received';
+
       console.log('[DIAN] Descargando grupo ' + g.grp + ' ' + g.desde + ': ' + g.docs.length + ' docs');
-      global._edianTotal = (global._edianTotal || 0) + g.docs.length;
-      if (!global._edianDescargados) global._edianDescargados = 0;
 
       const cufeMap = {};
       g.docs.forEach(function(d) { cufeMap[d.cufe] = d; });
 
       const startD = toFechaDIAN(g.desde);
       const endD   = toFechaDIAN(g.hasta);
-
-      // Para cada pagina de DataTables, recargamos la pagina y navegamos a esa pagina
-      // Esto evita que el estado se pierda despues de cada descarga
-      let paginaActual = 1;
-      let totalPaginas = Math.ceil(g.docs.length / 10);
       let totalDescargadosGrupo = 0;
+      const totalPaginas = Math.ceil(g.docs.length / 10);
 
-      // Cargar pagina, click primer boton para descubrir URL, luego usar URL directa
       await buscarYNavegar(page, pUrl, startD, endD, g.desde, g.hasta);
 
-      // Obtener primer CUFE visible para descubrir la URL de descarga
       const primerosCUFEs = await page.evaluate(function() {
         var cufes = [];
         document.querySelectorAll('button.download-document, button[data-id]').forEach(function(btn) {
@@ -586,127 +545,87 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, empresa, 
       if (primerCufeDescargable) {
         console.log('[DIAN] Descubriendo URL de descarga con ' + cufeMap[primerCufeDescargable].nombre + '...');
         urlDescargaInfo = await encontrarUrlDescarga(page, primerCufeDescargable);
-        // Marcar como descargado (ya lo bajamos en el proceso de descubrir)
-        const doc = cufeMap[primerCufeDescargable];
-        // Re-descargar via click normal para obtener el buffer
         const archivos = await descargarDocumentoClick(page, primerCufeDescargable);
         descargadosCUFE[primerCufeDescargable] = true;
         totalDescargadosGrupo++;
+        const doc = cufeMap[primerCufeDescargable];
         documentos.push({ ...doc, pdfBuffer: archivos?.pdfBuffer||null, xmlBuffer: archivos?.xmlBuffer||null, xmlText: archivos?.xmlText||'' });
         global._edianDescargados = (global._edianDescargados||0) + 1;
         console.log('[PROGRESS] ' + global._edianDescargados + '/' + (global._edianTotal||'?'));
       }
 
-      // Si tenemos URL de descarga, usarla directamente para TODOS los demas
       if (urlDescargaInfo) {
         const restantes = g.docs.filter(function(d){ return !descargadosCUFE[d.cufe]; });
         console.log('[DIAN] ' + (soloXML ? 'MODO RÁPIDO XML' : 'descarga completa') + ': ' + restantes.length + ' docs restantes');
 
         if (soloXML) {
-          // MODO RÁPIDO: descargar XMLs en paralelo (5 a la vez)
-          const { descargarXMLsParalelo } = require('./dianScraper');
           const rapidos = await descargarXMLsParalelo(page, restantes, urlDescargaInfo, descargadosCUFE, function() {
             global._edianDescargados = (global._edianDescargados||0) + 1;
-            emitProgreso && emitProgreso({ fase:'descargando', n: global._edianDescargados, total: global._edianTotal||0 });
           });
           rapidos.forEach(function(r){ documentos.push(r); });
         } else {
-        // MODO COMPLETO: descargar PDFs+XMLs uno a uno
-        for (const doc of g.docs) {
-          if (descargadosCUFE[doc.cufe]) continue;
-          console.log('  [DL URL] ' + doc.nombre);
-          const archivos = await descargarViaUrl(page, doc.cufe, urlDescargaInfo);
-          descargadosCUFE[doc.cufe] = true;
-          totalDescargadosGrupo++;
-          documentos.push({ ...doc, pdfBuffer: archivos?.pdfBuffer||null, xmlBuffer: archivos?.xmlBuffer||null, xmlText: archivos?.xmlText||'' });
-          global._edianDescargados = (global._edianDescargados||0) + 1;
+          for (const doc of g.docs) {
+            if (descargadosCUFE[doc.cufe]) continue;
+            console.log('  [DL URL] ' + doc.nombre);
+            const archivos = await descargarViaUrl(page, doc.cufe, urlDescargaInfo);
+            descargadosCUFE[doc.cufe] = true;
+            totalDescargadosGrupo++;
+            documentos.push({ ...doc, pdfBuffer: archivos?.pdfBuffer||null, xmlBuffer: archivos?.xmlBuffer||null, xmlText: archivos?.xmlText||'' });
+            global._edianDescargados = (global._edianDescargados||0) + 1;
+            console.log('[PROGRESS] ' + global._edianDescargados + '/' + (global._edianTotal||'?'));
+          }
         }
-        } // end modo completo
         console.log('[DIAN] Grupo ' + g.grp + ' (URL directa): ' + totalDescargadosGrupo + '/' + g.docs.length);
       } else {
         console.log('[DIAN] URL no encontrada, usando paginacion...');
-      // Fallback: paginacion
-      for (let pg = 1; pg <= totalPaginas + 2; pg++) {
-        // Siempre recargar con fechas antes de cada pagina
-        // Esto evita que los AJAX de las descargas reseteen el filtro
-        await buscarYNavegar(page, pUrl, startD, endD, g.desde, g.hasta);
-
-        // Navegar a la pagina correcta del DataTables
-        for (let salto = 1; salto < pg; salto++) {
-          // Esperar que el boton Next este disponible
-          await page.waitForFunction(function() {
-            var n = document.querySelector(
-              '#tbl-documents_next:not(.disabled), ' +
-              'li.paginate_button.next:not(.disabled) a, ' +
-              '.paginate_button.next:not(.disabled)'
-            );
-            return !!n;
-          }, { timeout: 8000 }).catch(function(){});
-
-          const ok = await page.evaluate(function() {
-            var n = document.querySelector(
-              '#tbl-documents_next:not(.disabled), ' +
-              'li.paginate_button.next:not(.disabled) a, ' +
-              '.paginate_button.next:not(.disabled)'
-            );
-            if (n) { n.click(); return true; }
-            // Debug: show what pagination buttons exist
-            var allPag = Array.from(document.querySelectorAll('.paginate_button, [id*="next"]')).map(function(el){
-              return el.id + '/' + el.className.substring(0,40);
+        for (let pg = 1; pg <= totalPaginas + 2; pg++) {
+          await buscarYNavegar(page, pUrl, startD, endD, g.desde, g.hasta);
+          for (let salto = 1; salto < pg; salto++) {
+            await page.waitForFunction(function() {
+              var n = document.querySelector('#tbl-documents_next:not(.disabled), li.paginate_button.next:not(.disabled) a, .paginate_button.next:not(.disabled)');
+              return !!n;
+            }, { timeout: 8000 }).catch(function(){});
+            const ok = await page.evaluate(function() {
+              var n = document.querySelector('#tbl-documents_next:not(.disabled), li.paginate_button.next:not(.disabled) a, .paginate_button.next:not(.disabled)');
+              if (n) { n.click(); return true; }
+              return false;
             });
-            console.log('Paginacion disponible:', allPag.join(' | '));
-            return false;
+            if (!ok) { pg = 9999; break; }
+            await page.waitForTimeout(150);
+            await page.waitForFunction(function() { return document.querySelectorAll('button.download-document, button[data-id]').length > 0; }, { timeout: 8000 }).catch(function(){});
+            await page.waitForTimeout(150);
+          }
+          if (pg > totalPaginas + 2) break;
+          const cufesVisibles = await page.evaluate(function() {
+            var cufes = [];
+            document.querySelectorAll('button.download-document, button[data-id]').forEach(function(btn) {
+              var cufe = btn.getAttribute('data-id') || btn.id;
+              if (cufe && cufe.length > 20) cufes.push(cufe);
+            });
+            return cufes;
           });
-          if (!ok) { pg = 9999; break; }
-          // Esperar que los nuevos botones carguen
-          await page.waitForTimeout(150);
-          await page.waitForFunction(function() {
-            return document.querySelectorAll('button.download-document, button[data-id]').length > 0;
-          }, { timeout: 8000 }).catch(function(){});
-          await page.waitForTimeout(150);
+          console.log('[DIAN] Pag ' + pg + '/' + totalPaginas + ': ' + cufesVisibles.length + ' botones');
+          if (cufesVisibles.length === 0) break;
+          let descargadosEnPagina = 0;
+          for (const cufe of cufesVisibles) {
+            if (!cufeMap[cufe] || descargadosCUFE[cufe]) continue;
+            const doc = cufeMap[cufe];
+            console.log('  [DL] ' + doc.nombre);
+            const archivos = await descargarDocumentoClick(page, cufe);
+            descargadosCUFE[cufe] = true;
+            descargadosEnPagina++;
+            totalDescargadosGrupo++;
+            documentos.push({ ...doc, pdfBuffer: archivos?.pdfBuffer||null, xmlBuffer: archivos?.xmlBuffer||null, xmlText: archivos?.xmlText||'' });
+            global._edianDescargados = (global._edianDescargados||0) + 1;
+          }
+          console.log('[DIAN] Pag ' + pg + ': +' + descargadosEnPagina + ' | total: ' + totalDescargadosGrupo + '/' + g.docs.length);
+          if (totalDescargadosGrupo >= g.docs.length) break;
+          if (descargadosEnPagina === 0) break;
         }
-        if (pg > totalPaginas + 2) break;
-
-        // Obtener CUFEs visibles
-        const cufesVisibles = await page.evaluate(function() {
-          var cufes = [];
-          document.querySelectorAll('button.download-document, button[data-id]').forEach(function(btn) {
-            var cufe = btn.getAttribute('data-id') || btn.id;
-            if (cufe && cufe.length > 20) cufes.push(cufe);
-          });
-          return cufes;
-        });
-
-        console.log('[DIAN] Pag ' + pg + '/' + totalPaginas + ': ' + cufesVisibles.length + ' botones');
-        if (cufesVisibles.length === 0) break;
-
-        // Descargar todos sin recargar entre ellos
-        let descargadosEnPagina = 0;
-        for (const cufe of cufesVisibles) {
-          if (!cufeMap[cufe] || descargadosCUFE[cufe]) continue;
-          const doc = cufeMap[cufe];
-          console.log('  [DL] ' + doc.nombre);
-          const archivos = await descargarDocumentoClick(page, cufe);
-          descargadosCUFE[cufe] = true;
-          descargadosEnPagina++;
-          totalDescargadosGrupo++;
-          documentos.push({
-            ...doc,
-            pdfBuffer: archivos?.pdfBuffer || null,
-            xmlBuffer: archivos?.xmlBuffer || null,
-            xmlText:   archivos?.xmlText   || '',
-          });
-        }
-        console.log('[DIAN] Pag ' + pg + ': +' + descargadosEnPagina + ' | total: ' + totalDescargadosGrupo + '/' + g.docs.length);
-        if (totalDescargadosGrupo >= g.docs.length) break;
-        if (descargadosEnPagina === 0) break;
-      } // end for pg
-      } // end if !urlDescargaInfo
-
+      }
       console.log('[DIAN] Grupo ' + g.grp + ': ' + totalDescargadosGrupo + '/' + g.docs.length);
     }
 
-    // Incluir los sin descarga
     todosDocumentos.forEach(function(doc) {
       if (!descargadosCUFE[doc.cufe]) {
         console.log('[DIAN] Sin descarga: ' + doc.nombre);
@@ -740,95 +659,10 @@ async function diagnosticarPortal(tokenUrl) {
   } finally { await browser.close(); }
 }
 
-module.exports = { descargarDIAN, diagnosticarPortal, parseTokenUrl };
-
-// ── MODO RÁPIDO: solo XMLs sin PDFs ───────────────────────────────────────────
-// Usa fetch directo con cookies de sesión del browser, sin clicks
-// 3-5x más rápido que el modo completo
-async function descargarSoloXMLs(page, cufe, urlInfo) {
-  try {
-    // Si tenemos URL de descarga directa, usarla con fetch paralelo
-    if (urlInfo && urlInfo.url) {
-      let url = urlInfo.url;
-      let body = urlInfo.bodyTemplate;
-      if (body) {
-        body = body.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
-        body = body.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
-        body = body.replace(/id=[^&]+/, 'id=' + encodeURIComponent(cufe));
-        body = body.replace(/[0-9a-f]{64,}/, cufe);
-      }
-      if (urlInfo.method === 'GET') {
-        url = url.replace(/trackId=[^&]+/, 'trackId=' + encodeURIComponent(cufe));
-        url = url.replace(/cufe=[^&]+/, 'cufe=' + encodeURIComponent(cufe));
-      }
-
-      // Fetch directo desde el browser (usa cookies de sesión)
-      const result = await page.evaluate(async function(params) {
-        try {
-          const resp = await fetch(params.url, {
-            method: params.method || 'GET',
-            headers: params.body ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {},
-            body: params.body || undefined,
-            credentials: 'include',
-          });
-          if (!resp.ok) return { error: 'HTTP ' + resp.status };
-          const arrayBuf = await resp.arrayBuffer();
-          // Convert to base64 for transfer
-          const bytes = new Uint8Array(arrayBuf);
-          let binary = '';
-          bytes.forEach(function(b) { binary += String.fromCharCode(b); });
-          return { ok: true, base64: btoa(binary), contentType: resp.headers.get('content-type') || '' };
-        } catch(e) { return { error: e.message }; }
-      }, { url, method: urlInfo.method, body: body || null });
-
-      if (result && result.ok && result.base64) {
-        const buffer = Buffer.from(result.base64, 'base64');
-        // Extract XML from ZIP
-        let xmlText = '', xmlBuffer = null;
-        try {
-          const JSZip2 = require('jszip');
-          const zip = await JSZip2.loadAsync(buffer);
-          for (const [fn, file] of Object.entries(zip.files)) {
-            if (fn.toLowerCase().endsWith('.xml')) {
-              xmlBuffer = await file.async('nodebuffer');
-              xmlText = xmlBuffer.toString('utf8');
-              break;
-            }
-          }
-        } catch(e) {
-          // Maybe it IS the xml directly
-          xmlText = buffer.toString('utf8');
-          if (xmlText.includes('<?xml') || xmlText.includes('<Invoice')) {
-            xmlBuffer = buffer;
-          }
-        }
-        return { pdfBuffer: null, xmlBuffer, xmlText };
-      }
-    }
-    return { pdfBuffer: null, xmlBuffer: null, xmlText: '' };
-  } catch(e) {
-    console.error('[XML FAST]', e.message.substring(0,80));
-    return { pdfBuffer: null, xmlBuffer: null, xmlText: '' };
-  }
-}
-
-// Descarga XMLs en lotes paralelos (5 a la vez)
-async function descargarXMLsParalelo(page, docs, urlInfo, descargadosCUFE, onProgress) {
-  const BATCH = 5;
-  const resultados = [];
-  for (let i = 0; i < docs.length; i += BATCH) {
-    const lote = docs.slice(i, i + BATCH);
-    const promesas = lote.map(async function(doc) {
-      if (descargadosCUFE[doc.cufe]) return null;
-      const archivos = await descargarSoloXMLs(page, doc.cufe, urlInfo);
-      descargadosCUFE[doc.cufe] = true;
-      if (onProgress) onProgress();
-      return { ...doc, pdfBuffer: null, xmlBuffer: archivos.xmlBuffer, xmlText: archivos.xmlText };
-    });
-    const loteRes = await Promise.all(promesas);
-    loteRes.forEach(function(r) { if (r) resultados.push(r); });
-  }
-  return resultados;
-}
-
-module.exports.descargarXMLsParalelo = descargarXMLsParalelo;
+// ── Exports — TODO al final, una sola vez ─────────────────────
+module.exports = {
+  descargarDIAN,
+  diagnosticarPortal,
+  parseTokenUrl,
+  descargarXMLsParalelo,
+};
