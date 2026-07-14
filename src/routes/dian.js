@@ -15,28 +15,16 @@ function limpiarCacheVieja() {
 }
 setInterval(limpiarCacheVieja, 5 * 60 * 1000);
 
-// ── SSE progreso — declarado PRIMERO para que emitProgreso esté disponible ──
-const _progresoClients = new Set();
-
-router.get('/progreso', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-  const client = { res, id: Date.now() };
-  _progresoClients.add(client);
-  const state = global._edianProgreso || { n: 0, total: 0, fase: 'idle' };
-  res.write('data: ' + JSON.stringify(state) + '\n\n');
-  req.on('close', () => _progresoClients.delete(client));
-});
-
+// ── Progreso via polling (SSE no compatible con Railway HTTP/2) ──
 function emitProgreso(data) {
   global._edianProgreso = data;
-  const msg = 'data: ' + JSON.stringify(data) + '\n\n';
-  for (const client of _progresoClients) {
-    try { client.res.write(msg); } catch(e) { _progresoClients.delete(client); }
-  }
 }
+
+// GET /api/dian/progreso — polling simple cada 1s desde el frontend
+router.get('/progreso', (req, res) => {
+  const state = global._edianProgreso || { n: 0, total: 0, fase: 'idle' };
+  res.json(state);
+});
 
 /**
  * POST /api/dian/validar-token
