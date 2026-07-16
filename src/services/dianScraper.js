@@ -253,15 +253,16 @@ async function encontrarUrlDescarga(page, primerCufe) {
   };
   page.on('request', handler);
   try {
-    await Promise.all([
-      page.waitForEvent('download', { timeout: 20000 }),
-      page.evaluate(function(id) {
-        var el = document.getElementById(id);
-        if (!el) { var btns = document.querySelectorAll('button[data-id]'); for (var i = 0; i < btns.length; i++) { if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; } } }
-        if (el) { el.click(); return true; }
-        return false;
-      }, primerCufe),
-    ]);
+    // Click y esperar interceptación (sin esperar evento download)
+    await page.evaluate(function(id) {
+      var el = document.getElementById(id);
+      if (!el) { var btns = document.querySelectorAll('button[data-id]'); for (var i = 0; i < btns.length; i++) { if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; } } }
+      if (el) el.click();
+    }, primerCufe);
+    // Esperar hasta 8s a que se intercepte la URL de descarga
+    for (let i = 0; i < 16 && !downloadUrl; i++) {
+      await page.waitForTimeout(500);
+    }
   } catch(e) { console.log('[INTERCEPT DL] Error en primer click:', e.message.substring(0,80)); }
   page.off('request', handler);
   if (downloadUrl) {
@@ -313,29 +314,64 @@ async function descargarViaUrl(page, cufe, urlInfo) {
 
 async function descargarDocumentoClick(page, cufe) {
   try {
-    const [download] = await Promise.all([
-      page.waitForEvent('download', { timeout: 25000 }),
-      page.evaluate(function(id) {
-        var el = document.getElementById(id);
-        if (!el) { var btns = document.querySelectorAll('button[data-id]'); for (var i = 0; i < btns.length; i++) { if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; } } }
-        if (el) { el.click(); return true; }
-        return false;
-      }, cufe),
-    ]);
-    const buffer = fs.readFileSync(await download.path());
-    let pdfBuffer = null, xmlBuffer = null, xmlText = '';
-    try {
-      const zip = await JSZip.loadAsync(buffer);
-      for (const [fn, file] of Object.entries(zip.files)) {
-        if (fn.toLowerCase().endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
-        if (fn.toLowerCase().endsWith('.xml')) { xmlBuffer = await file.async('nodebuffer'); xmlText = await file.async('text'); }
+    // Interceptar el request de descarga en vez de esperar evento download
+    let capturedUrl = null, capturedMethod = null, capturedBody = null;
+    const reqHandler = function(req) {
+      const u = req.url();
+      if (u.includes('Download') || u.includes('download') || u.includes('GetFile') || u.includes('Zip') || u.includes('zip')) {
+        if (u.includes('dian.gov.co') || u.includes('catalogo')) {
+          capturedUrl = u;
+          capturedMethod = req.method();
+          capturedBody = req.postData();
+        }
       }
-    } catch(e) {
-      const n = (download.suggestedFilename()||'').toLowerCase();
-      if (n.endsWith('.xml')) { xmlBuffer = buffer; xmlText = buffer.toString('utf8'); }
-      else if (n.endsWith('.pdf')) pdfBuffer = buffer;
+    };
+    page.on('request', reqHandler);
+
+    // Click el botón
+    await page.evaluate(function(id) {
+      var el = document.getElementById(id);
+      if (!el) { var btns = document.querySelectorAll('button[data-id]'); for (var i = 0; i < btns.length; i++) { if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; } } }
+      if (el) el.click();
+    }, cufe);
+
+    // Esperar hasta 5s a que se intercepte la URL
+    await page.waitForTimeout(500);
+    for (let i = 0; i < 9 && !capturedUrl; i++) {
+      await page.waitForTimeout(500);
     }
-    return { pdfBuffer, xmlBuffer, xmlText };
+    page.off('request', reqHandler);
+
+    // Si capturamos la URL, descargar via fetch con cookies
+    if (capturedUrl) {
+      const urlInfo = { url: capturedUrl, method: capturedMethod, bodyTemplate: capturedBody };
+      return await descargarViaUrl(page, cufe, urlInfo);
+    }
+
+    // Fallback: intentar download event con timeout corto
+    try {
+      const [download] = await Promise.all([
+        page.waitForEvent('download', { timeout: 8000 }),
+        page.evaluate(function(id) {
+          var el = document.getElementById(id);
+          if (!el) { var btns = document.querySelectorAll('button[data-id]'); for (var i = 0; i < btns.length; i++) { if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; } } }
+          if (el) el.click();
+        }, cufe),
+      ]);
+      const buffer = fs.readFileSync(await download.path());
+      let pdfBuffer = null, xmlBuffer = null, xmlText = '';
+      const zip = await JSZip.loadAsync(buffer).catch(function(){return null;});
+      if (zip) {
+        for (const [fn, file] of Object.entries(zip.files)) {
+          if (fn.toLowerCase().endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
+          if (fn.toLowerCase().endsWith('.xml')) { xmlBuffer = await file.async('nodebuffer'); xmlText = await file.async('text'); }
+        }
+      }
+      return { pdfBuffer, xmlBuffer, xmlText };
+    } catch(e2) {
+      console.error('  [ERR DL fallback]', e2.message.substring(0,60));
+      return { pdfBuffer: null, xmlBuffer: null, xmlText: '' };
+    }
   } catch(e) { console.error('  [ERR DL]', e.message.substring(0,80)); return null; }
 }
 
