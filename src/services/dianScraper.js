@@ -54,26 +54,28 @@ async function autenticar(context, page, pk, nit, token) {
   console.log('[DIAN] Autenticando NIT ' + nit);
   await page.goto(
     'https://catalogo-vpfe.dian.gov.co/User/AuthToken?pk=' + pk + '&rk=' + nit + '&token=' + token,
-    { waitUntil: 'networkidle', timeout: 40000 }
+    { waitUntil: 'domcontentloaded', timeout: 40000 }
   );
-  // Esperar a que la sesión se establezca completamente
-  await page.waitForTimeout(2000);
 
-  // Si redirigió a login, el token expiró
-  if (page.url().includes('/User/Login') || page.url().includes('/Login')) {
-    throw new Error('Token invalido o expirado. Solicita un nuevo token en la DIAN.');
+  // Esperar redirección post-auth (la DIAN procesa el token y redirige)
+  await page.waitForTimeout(3000);
+
+  // Si sigue en AuthToken, esperar la redirección
+  if (page.url().includes('AuthToken')) {
+    try {
+      await page.waitForURL(function(url) {
+        return !url.includes('AuthToken');
+      }, { timeout: 10000 });
+      await page.waitForTimeout(1000);
+    } catch(e) {}
   }
 
-  // Verificar que hay cookies de sesión activas
-  const cookies = await context.cookies();
-  const hasSesion = cookies.some(function(c) {
-    return c.name.toLowerCase().includes('session') ||
-           c.name.toLowerCase().includes('auth') ||
-           c.name.toLowerCase().includes('aspnet') ||
-           c.name === '.AspNet.ApplicationCookie' ||
-           c.domain.includes('dian.gov.co');
-  });
-  console.log('[DIAN] Autenticado OK — URL: ' + page.url() + ' | cookies: ' + cookies.length + ' | sesion: ' + hasSesion);
+  const finalUrl = page.url();
+  console.log('[DIAN] Autenticado — URL final: ' + finalUrl);
+
+  if (finalUrl.includes('/User/Login') || finalUrl.includes('/Login')) {
+    throw new Error('Token invalido o expirado. Solicita un nuevo token en la DIAN.');
+  }
 }
 
 async function obtenerCUFEsViaAjax(page, url, startDate, endDate, startISO, endISO) {
