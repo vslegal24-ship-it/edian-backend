@@ -80,9 +80,20 @@ async function autenticar(context, page, pk, nit, token) {
 
 async function obtenerCUFEsViaAjax(page, url, startDate, endDate, startISO, endISO) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  console.log('[DIAN] Pagina cargada: ' + page.url());
+  // Esperar a que la página esté estable (evita context destroyed)
+  await page.waitForTimeout(1500);
+  await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(function(){});
 
-  await page.evaluate(function(p) {
+  const currentUrl = page.url();
+  console.log('[DIAN] Pagina cargada: ' + currentUrl);
+
+  // Si redirigió a login, la sesión expiró
+  if (currentUrl.includes('/Login') || currentUrl.includes('/login')) {
+    console.log('[DIAN] Sesión expirada en ' + url + ' — retornando 0 CUFEs');
+    return [];
+  }
+
+  await safeEval(page, function(p) {
     var sEl = document.getElementById('startDate'); if (sEl) sEl.value = p.start;
     var eEl = document.getElementById('endDate');   if (eEl) eEl.value = p.end;
     var rEl = document.getElementById('dashboard-report-range');
@@ -93,7 +104,7 @@ async function obtenerCUFEsViaAjax(page, url, startDate, endDate, startISO, endI
         try { var dr = $(rEl).data('daterangepicker'); if (dr) { dr.setStartDate(p.startISO); dr.setEndDate(p.endISO); } } catch(e) {}
       }
     }
-  }, { start: startDate, end: endDate, startISO, endISO });
+  }, { start: startDate, end: endDate, startISO, endISO }).catch(function(e){ console.log('[DIAN] Eval fechas error:', e.message.substring(0,60)); });
 
   let ajaxUrl = null, ajaxPayload = null, ajaxHeaders = {};
   page.on('request', function(req) {
