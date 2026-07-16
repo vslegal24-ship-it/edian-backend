@@ -269,15 +269,25 @@ async function encontrarUrlDescarga(page, primerCufe) {
   };
   page.on('request', handler);
   try {
-    // Click y esperar interceptación (sin esperar evento download)
+    const context2 = page.context();
+    // Intentar capturar nueva pestaña primero
+    const newPagePromise = context2.waitForEvent('page', { timeout: 12000 }).catch(function(){return null;});
     await page.evaluate(function(id) {
       var el = document.getElementById(id);
       if (!el) { var btns = document.querySelectorAll('button[data-id]'); for (var i = 0; i < btns.length; i++) { if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; } } }
       if (el) el.click();
     }, primerCufe);
-    // Esperar hasta 8s a que se intercepte la URL de descarga
+    // Esperar hasta 8s
     for (let i = 0; i < 16 && !downloadUrl; i++) {
       await page.waitForTimeout(500);
+    }
+    const newP = await newPagePromise;
+    if (newP) {
+      await newP.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(function(){});
+      downloadUrl = newP.url();
+      downloadMethod = 'GET';
+      console.log('[INTERCEPT DL] Nueva pestaña URL: ' + downloadUrl.substring(0,100));
+      await newP.close().catch(function(){});
     }
   } catch(e) { console.log('[INTERCEPT DL] Error en primer click:', e.message.substring(0,80)); }
   page.off('request', handler);
@@ -330,47 +340,78 @@ async function descargarViaUrl(page, cufe, urlInfo) {
 
 async function descargarDocumentoClick(page, cufe) {
   try {
-    // Interceptar el request de descarga en vez de esperar evento download
-    let capturedUrl = null, capturedMethod = null, capturedBody = null;
-    const reqHandler = function(req) {
-      const u = req.url();
-      if (u.includes('Download') || u.includes('download') || u.includes('GetFile') || u.includes('Zip') || u.includes('zip')) {
-        if (u.includes('dian.gov.co') || u.includes('catalogo')) {
-          capturedUrl = u;
-          capturedMethod = req.method();
-          capturedBody = req.postData();
-        }
-      }
-    };
-    page.on('request', reqHandler);
+    const context = page.context();
 
-    // Click el botón
-    await page.evaluate(function(id) {
-      var el = document.getElementById(id);
-      if (!el) { var btns = document.querySelectorAll('button[data-id]'); for (var i = 0; i < btns.length; i++) { if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; } } }
-      if (el) el.click();
-    }, cufe);
-
-    // Esperar hasta 5s a que se intercepte la URL
-    await page.waitForTimeout(500);
-    for (let i = 0; i < 9 && !capturedUrl; i++) {
-      await page.waitForTimeout(500);
-    }
-    page.off('request', reqHandler);
-
-    // Si capturamos la URL, descargar via fetch con cookies
-    if (capturedUrl) {
-      const urlInfo = { url: capturedUrl, method: capturedMethod, bodyTemplate: capturedBody };
-      return await descargarViaUrl(page, cufe, urlInfo);
-    }
-
-    // Fallback: intentar download event con timeout corto
+    // Estrategia 1: Interceptar nueva pestaña (la DIAN abre el ZIP en nueva pestaña)
     try {
-      const [download] = await Promise.all([
-        page.waitForEvent('download', { timeout: 8000 }),
+      const [newPage] = await Promise.all([
+        context.waitForEvent('page', { timeout: 12000 }),
         page.evaluate(function(id) {
           var el = document.getElementById(id);
-          if (!el) { var btns = document.querySelectorAll('button[data-id]'); for (var i = 0; i < btns.length; i++) { if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; } } }
+          if (!el) {
+            var btns = document.querySelectorAll('button[data-id]');
+            for (var i = 0; i < btns.length; i++) {
+              if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; }
+            }
+          }
+          if (el) el.click();
+        }, cufe),
+      ]);
+
+      // Esperar que la nueva página cargue
+      await newPage.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(function(){});
+      await newPage.waitForTimeout(1000);
+
+      const newUrl = newPage.url();
+      console.log('  [NEW PAGE] URL: ' + newUrl.substring(0, 100));
+
+      // Descargar desde la nueva pestaña usando fetch con cookies
+      const resultado = await safeEval(newPage, async function() {
+        try {
+          const resp = await fetch(window.location.href, { credentials: 'include' });
+          if (!resp.ok) return { error: 'HTTP ' + resp.status };
+          const arr = await resp.arrayBuffer();
+          const bytes = new Uint8Array(arr);
+          let binary = '';
+          bytes.forEach(function(b){ binary += String.fromCharCode(b); });
+          return { ok: true, base64: btoa(binary) };
+        } catch(e) { return { error: e.message }; }
+      }, null);
+
+      await newPage.close().catch(function(){});
+
+      if (resultado && resultado.ok && resultado.base64) {
+        const buffer = Buffer.from(resultado.base64, 'base64');
+        let pdfBuffer = null, xmlBuffer = null, xmlText = '';
+        try {
+          const zip = await JSZip.loadAsync(buffer);
+          for (const [fn, file] of Object.entries(zip.files)) {
+            if (fn.toLowerCase().endsWith('.pdf')) pdfBuffer = await file.async('nodebuffer');
+            if (fn.toLowerCase().endsWith('.xml')) { xmlBuffer = await file.async('nodebuffer'); xmlText = await file.async('text'); }
+          }
+        } catch(e) {
+          xmlText = buffer.toString('utf8');
+          if (xmlText.includes('<?xml') || xmlText.includes('<Invoice')) xmlBuffer = buffer;
+          else pdfBuffer = buffer;
+        }
+        return { pdfBuffer, xmlBuffer, xmlText };
+      }
+    } catch(e1) {
+      console.log('  [DL] Nueva pestaña no detectada, probando download event...');
+    }
+
+    // Estrategia 2: evento download clásico
+    try {
+      const [download] = await Promise.all([
+        page.waitForEvent('download', { timeout: 10000 }),
+        page.evaluate(function(id) {
+          var el = document.getElementById(id);
+          if (!el) {
+            var btns = document.querySelectorAll('button[data-id]');
+            for (var i = 0; i < btns.length; i++) {
+              if (btns[i].getAttribute('data-id') === id) { el = btns[i]; break; }
+            }
+          }
           if (el) el.click();
         }, cufe),
       ]);
@@ -385,10 +426,13 @@ async function descargarDocumentoClick(page, cufe) {
       }
       return { pdfBuffer, xmlBuffer, xmlText };
     } catch(e2) {
-      console.error('  [ERR DL fallback]', e2.message.substring(0,60));
+      console.error('  [ERR DL]', e2.message.substring(0,60));
       return { pdfBuffer: null, xmlBuffer: null, xmlText: '' };
     }
-  } catch(e) { console.error('  [ERR DL]', e.message.substring(0,80)); return null; }
+  } catch(e) {
+    console.error('  [ERR DL]', e.message.substring(0,80));
+    return { pdfBuffer: null, xmlBuffer: null, xmlText: '' };
+  }
 }
 
 async function buscarYNavegar(page, url, startDate, endDate, startISO, endISO) {
