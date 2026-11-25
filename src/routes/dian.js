@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { descargarDIAN, diagnosticarPortal, parseTokenUrl } = require('../services/dianScraper');
+const { descargarDIAN, diagnosticarPortal, parseTokenUrl, docsDesdeArchivo } = require('../services/dianScraper');
 const { procesarLote, parseXmlDIAN } = require('../services/xmlParser');
 const multer = require('multer');
 const subida = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 1000 } });
@@ -123,6 +123,45 @@ router.post('/listar', (req, res) => {
   res.json({ ok: true, jobId });
 });
 
+/**
+ * POST /api/dian/descargar-listado  (multipart)
+ *   listado: archivo Excel (.xlsx) o ZIP del "Descargar listados" de la DIAN
+ *   tokenUrl, empresa: para entrar y nombrar
+ * Lee los CUFEs del Excel y descarga XML+PDF desde gratis-vpfe (sin rastrear el catálogo).
+ * Responde { ok, jobId }; el resultado se consulta en GET /api/dian/job/:jobId.
+ */
+router.post('/descargar-listado', subida.single('listado'), async (req, res) => {
+  try {
+    const { tokenUrl } = req.body;
+    if (!tokenUrl) return res.status(400).json({ ok: false, error: 'Falta el token de la DIAN' });
+    if (!req.file) return res.status(400).json({ ok: false, error: 'Falta el archivo del listado (Excel)' });
+    if ([...jobs.values()].some(j => j.estado === 'procesando')) {
+      return res.status(429).json({ ok: false, error: 'Ya hay una descarga en curso. Espera a que termine.' });
+    }
+    let docs;
+    try { docs = await docsDesdeArchivo(req.file.buffer); }
+    catch (e) { return res.status(400).json({ ok: false, error: 'No pude leer el Excel: ' + e.message }); }
+    if (!docs.length) return res.status(400).json({ ok: false, error: 'El Excel no trae documentos con CUFE' });
+
+    const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const job = { estado: 'procesando', creado: Date.now(), progreso: { fase: 'conectando', n: 0, total: docs.length } };
+    jobs.set(jobId, job);
+    const body = {
+      tokenUrl,
+      empresa: req.body.empresa || 'EDIAN',
+      fechaInicio: req.body.fechaInicio || '',
+      fechaFin: req.body.fechaFin || '',
+      modulos: ['soportes', 'terceros', 'items'],
+    };
+    ejecutarDescarga(body, p => { job.progreso = p; }, docs)
+      .then(resultado => { job.estado = 'listo'; job.resultado = resultado; })
+      .catch(err => { job.estado = 'error'; job.error = err.message; console.error('[API] Error en job-listado ' + jobId + ':', err.message); });
+    res.json({ ok: true, jobId, total: docs.length });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 function nombreArchivo(fac) {
   const limpio = s => String(s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/[^a-zA-Z0-9\-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
   const partes = [
@@ -239,17 +278,17 @@ router.post('/procesar-zips', subida.array('archivos', 1000), async (req, res) =
   }
 });
 
-async function ejecutarDescarga(body, onJobProgreso) {
+async function ejecutarDescarga(body, onJobProgreso, documentosPrecargados) {
   const { tokenUrl, fechaInicio, fechaFin, grupo = '', empresa = 'EDIAN', modulos = ['soportes', 'terceros', 'items'] } = body;
   const soloXML = !modulos.includes('soportes');
   const avisar = p => { emitProgreso(p); if (onJobProgreso) onJobProgreso(p); };
 
   try {
-    console.log(`[API] Iniciando descarga: ${fechaInicio} a ${fechaFin} | grupo: ${grupo || 'todos'} | módulos: ${modulos.join(',')}`);
+    console.log(`[API] Iniciando descarga: ${fechaInicio} a ${fechaFin} | grupo: ${grupo || 'todos'} | módulos: ${modulos.join(',')}${documentosPrecargados ? ' | desde listado subido (' + documentosPrecargados.length + ')' : ''}`);
     avisar({ fase: 'conectando', n: 0, total: 0 });
 
     const { documentos, nit, filasEncontradas, sinArchivo } = await descargarDIAN({
-      tokenUrl, fechaInicio, fechaFin, grupo, soloXML, onProgreso: avisar,
+      tokenUrl, fechaInicio, fechaFin, grupo, soloXML, documentosPrecargados, onProgreso: avisar,
     });
 
     if (documentos.length === 0) {
