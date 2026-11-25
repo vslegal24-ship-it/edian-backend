@@ -1,7 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const { descargarDIAN, diagnosticarPortal, parseTokenUrl } = require('../services/dianScraper');
-const { procesarLote } = require('../services/xmlParser');
+const { procesarLote, parseXmlDIAN } = require('../services/xmlParser');
+const multer = require('multer');
+const subida = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 1000 } });
 const { generarExcelItems, generarExcelResumen } = require('../utils/excelGenerator');
 const JSZip = require('jszip');
 
@@ -87,6 +89,154 @@ router.get('/job/:id', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ ok: false, error: 'Proceso no encontrado (pudo expirar o el servidor se reinició).' });
   res.json({ ok: true, estado: job.estado, progreso: job.progreso, resultado: job.resultado, error: job.error });
+});
+
+/**
+ * POST /api/dian/listar  { tokenUrl, fechaInicio, fechaFin, grupo }
+ * Solo busca en la DIAN (sin descargar). Responde { ok, jobId }; el resultado
+ * (GET /job/:id) trae { documentos: [{cufe, nombre, fecha, nitEmisor, ...}] }.
+ */
+router.post('/listar', (req, res) => {
+  const { tokenUrl, fechaInicio, fechaFin, grupo = '' } = req.body;
+  if (!tokenUrl || !fechaInicio || !fechaFin) {
+    return res.status(400).json({ ok: false, error: 'tokenUrl, fechaInicio y fechaFin son requeridos' });
+  }
+  if ([...jobs.values()].some(j => j.estado === 'procesando')) {
+    return res.status(429).json({ ok: false, error: 'Ya hay un proceso en curso. Espera a que termine.' });
+  }
+  const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const job = { estado: 'procesando', creado: Date.now(), progreso: { fase: 'conectando', n: 0, total: 0 } };
+  jobs.set(jobId, job);
+  descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloListar: true, onProgreso: p => { job.progreso = p; } })
+    .then(r => {
+      job.estado = 'listo';
+      job.resultado = {
+        ok: true, nit: r.nit, total: r.total,
+        documentos: r.documentos.map(d => ({
+          cufe: d.cufe, nombre: d.nombre, tipo: d.tipo, fecha: d.fecha, grupo: d.grupo,
+          nitEmisor: d.nitEmisor, nomEmisor: d.nomEmisor, nitReceptor: d.nitReceptor, nomReceptor: d.nomReceptor,
+          total: d.total, cufeUrl: d.cufeUrl,
+        })),
+      };
+    })
+    .catch(err => { job.estado = 'error'; job.error = err.message; console.error('[API] Error listando:', err.message); });
+  res.json({ ok: true, jobId });
+});
+
+function nombreArchivo(fac) {
+  const limpio = s => String(s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/[^a-zA-Z0-9\-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+  const partes = [
+    limpio(fac.emisor && fac.emisor.nit),
+    limpio(fac.emisor && fac.emisor.nombre).substring(0, 30),
+    limpio(fac.folio || fac.numero || 'sin-folio'),
+    String(fac.fecha || '').replace(/[^0-9]/g, '').substring(0, 8),
+  ];
+  return partes.filter(Boolean).join('_') || 'documento';
+}
+
+/**
+ * POST /api/dian/procesar-zips  (multipart)
+ *   archivos[]: ZIPs (o XML/PDF sueltos) descargados de la DIAN
+ *   listado:    JSON opcional con [{cufe, nombre, ...}] para saber cuáles faltan
+ *   empresa, fechaInicio, fechaFin: para nombrar el ZIP final
+ * Responde { ok, facturas, items, filas, facturas_data, faltantes, sobrantes, errores, zipKey }
+ */
+router.post('/procesar-zips', subida.array('archivos', 1000), async (req, res) => {
+  try {
+    if (!req.files || !req.files.length) return res.status(400).json({ ok: false, error: 'No se recibieron archivos' });
+    const empresa = req.body.empresa || 'EDIAN';
+    const fechaInicio = req.body.fechaInicio || '';
+    const fechaFin = req.body.fechaFin || '';
+    let listado = [];
+    try { listado = JSON.parse(req.body.listado || '[]'); } catch (e) {}
+
+    // 1. Sacar los pares XML/PDF de cada archivo subido
+    const paquetes = []; // { origen, xml, pdf }
+    const errores = [];
+    for (const f of req.files) {
+      const nom = f.originalname || 'archivo';
+      const low = nom.toLowerCase();
+      try {
+        if (low.endsWith('.zip')) {
+          const zip = await JSZip.loadAsync(f.buffer);
+          const xmls = [], pdfs = [];
+          for (const [fn, entry] of Object.entries(zip.files)) {
+            if (entry.dir) continue;
+            if (fn.toLowerCase().endsWith('.xml')) xmls.push(await entry.async('nodebuffer'));
+            if (fn.toLowerCase().endsWith('.pdf')) pdfs.push(await entry.async('nodebuffer'));
+          }
+          if (!xmls.length) errores.push({ nombre: nom, error: 'El ZIP no trae XML' });
+          xmls.forEach((x, i) => paquetes.push({ origen: nom, xml: x, pdf: pdfs[i] || (xmls.length === 1 ? pdfs[0] : null) || null }));
+        } else if (low.endsWith('.xml')) {
+          paquetes.push({ origen: nom, xml: f.buffer, pdf: null });
+        } else {
+          errores.push({ nombre: nom, error: 'Tipo de archivo no soportado (solo .zip o .xml)' });
+        }
+      } catch (e) {
+        errores.push({ nombre: nom, error: 'No se pudo abrir: ' + e.message });
+      }
+    }
+
+    // 2. Leer cada XML y quitar duplicados por CUFE
+    const porCufe = new Map();
+    for (const p of paquetes) {
+      const xmlText = p.xml.toString('utf8');
+      try {
+        const fac = await parseXmlDIAN(xmlText);
+        const key = String(fac.cufe || fac.folio || p.origen);
+        if (!porCufe.has(key)) porCufe.set(key, { fac, xmlText, xml: p.xml, pdf: p.pdf, origen: p.origen });
+      } catch (e) {
+        errores.push({ nombre: p.origen, error: e.message });
+      }
+    }
+    const docs = [...porCufe.values()];
+    if (!docs.length) return res.status(400).json({ ok: false, error: 'Ningún archivo tenía una factura válida', errores });
+
+    // 3. Filas para los Excel
+    const { facturas, filas } = await procesarLote(docs.map(d => ({ xmlText: d.xmlText, nombre: d.origen })));
+
+    // 4. Cruce con el listado de la DIAN
+    const subidos = new Set(docs.map(d => String(d.fac.cufe)));
+    const enListado = new Set(listado.map(l => String(l.cufe)));
+    const faltantes = listado.filter(l => !subidos.has(String(l.cufe)));
+    const sobrantes = listado.length ? docs.filter(d => !enListado.has(String(d.fac.cufe))).map(d => d.fac.folio) : [];
+
+    // 5. ZIP final con archivos renombrados + Excel
+    const zipObj = new JSZip();
+    const folder = zipObj.folder('facturas');
+    const { buffer: xlsBuf, filename: xlsName } = generarExcelItems(filas, facturas, { empresa, fechaIni: fechaInicio, fechaFin });
+    folder.file(xlsName, xlsBuf);
+    const usados = {};
+    for (const d of docs) {
+      let base = nombreArchivo(d.fac);
+      if (usados[base]) base += '_' + (++usados[base]); else usados[base] = 1;
+      folder.file(base + '.xml', d.xml);
+      if (d.pdf) folder.file(base + '.pdf', d.pdf);
+    }
+    if (faltantes.length) {
+      const txt = 'Documentos del listado DIAN que no se subieron:\r\n\r\n' +
+        faltantes.map(f => [f.nombre, f.fecha, f.nitEmisor, f.nomEmisor, f.cufe].join(' | ')).join('\r\n');
+      folder.file('FALTANTES.txt', txt);
+    }
+    const zipBuffer = await zipObj.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    const zipKey = Date.now() + '_subida';
+    const emp = empresa.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 20);
+    zipCache.set(zipKey, {
+      buffer: zipBuffer,
+      filename: emp + '_' + fechaInicio.replace(/-/g, '') + '_' + fechaFin.replace(/-/g, '') + '.zip',
+      timestamp: Date.now(), empresa, fechaIni: fechaInicio, fechaFin, nFacturas: facturas.length,
+    });
+    console.log('[SUBIDA] ' + req.files.length + ' archivos -> ' + docs.length + ' facturas, faltan ' + faltantes.length);
+
+    res.json({
+      ok: true, facturas: facturas.length, items: filas.length, filas, facturas_data: facturas,
+      faltantes, sobrantes, errores, zipKey,
+      sinPdf: docs.filter(d => !d.pdf).length,
+    });
+  } catch (err) {
+    console.error('[SUBIDA] Error:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 async function ejecutarDescarga(body, onJobProgreso) {
