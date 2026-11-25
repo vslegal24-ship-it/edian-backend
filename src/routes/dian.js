@@ -40,46 +40,80 @@ router.post('/validar-token', (req, res) => {
   }
 });
 
+// ── Trabajos en segundo plano ──────────────────────────────────
+// Railway corta las peticiones HTTP largas. Por eso /descargar con {async:true}
+// responde al instante con un jobId y el navegador consulta /job/:id hasta que termine.
+const jobs = new Map();
+setInterval(() => {
+  const ahora = Date.now();
+  for (const [id, j] of jobs.entries()) if (ahora - j.creado > 120 * 60 * 1000) jobs.delete(id);
+}, 5 * 60 * 1000);
+
 /**
  * POST /api/dian/descargar
+ *   body.async === true  -> { ok, jobId }  (luego GET /api/dian/job/:jobId)
+ *   sin async            -> respuesta completa como antes (compatibilidad)
  */
 router.post('/descargar', async (req, res) => {
-  const { tokenUrl, fechaInicio, fechaFin, grupo = '', empresa = 'EDIAN', modulos = ['soportes','terceros','items'] } = req.body;
-  const soloXML = !modulos.includes('soportes');
-
+  const { tokenUrl, fechaInicio, fechaFin } = req.body;
   if (!tokenUrl || !fechaInicio || !fechaFin) {
-    return res.status(400).json({ error: 'tokenUrl, fechaInicio y fechaFin son requeridos' });
+    return res.status(400).json({ ok: false, error: 'tokenUrl, fechaInicio y fechaFin son requeridos' });
+  }
+
+  if (req.body.async) {
+    const ocupado = [...jobs.values()].some(j => j.estado === 'procesando');
+    if (ocupado) {
+      return res.status(429).json({ ok: false, error: 'Ya hay una descarga en curso. Espera a que termine e inténtalo de nuevo.' });
+    }
+    const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const job = { estado: 'procesando', creado: Date.now(), progreso: { fase: 'conectando', n: 0, total: 0 } };
+    jobs.set(jobId, job);
+    ejecutarDescarga(req.body, p => { job.progreso = p; })
+      .then(resultado => { job.estado = 'listo'; job.resultado = resultado; })
+      .catch(err => { job.estado = 'error'; job.error = err.message; console.error('[API] Error en job ' + jobId + ':', err.message); });
+    return res.json({ ok: true, jobId });
   }
 
   try {
-    console.log(`[API] Iniciando descarga: ${fechaInicio} a ${fechaFin} | módulos: ${modulos.join(',')}`);
+    res.json(await ejecutarDescarga(req.body));
+  } catch (err) {
+    console.error('[API] Error en descarga:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
-    global._edianDescargados = 0;
-    global._edianTotal = 0;
-    emitProgreso({ fase: 'conectando', n: 0, total: 0 });
+/** GET /api/dian/job/:id -> { estado: 'procesando'|'listo'|'error', progreso, resultado?, error? } */
+router.get('/job/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ ok: false, error: 'Proceso no encontrado (pudo expirar o el servidor se reinició).' });
+  res.json({ ok: true, estado: job.estado, progreso: job.progreso, resultado: job.resultado, error: job.error });
+});
 
-    const _progressInterval = setInterval(() => {
-      const n = global._edianDescargados || 0;
-      const t = global._edianTotal || 0;
-      if (t > 0) emitProgreso({ fase: 'descargando', n, total: t });
-    }, 1000);
+async function ejecutarDescarga(body, onJobProgreso) {
+  const { tokenUrl, fechaInicio, fechaFin, grupo = '', empresa = 'EDIAN', modulos = ['soportes', 'terceros', 'items'] } = body;
+  const soloXML = !modulos.includes('soportes');
+  const avisar = p => { emitProgreso(p); if (onJobProgreso) onJobProgreso(p); };
 
-    let documentos, nit, total;
-    try {
-      ({ documentos, nit, total } = await descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloXML }));
-    } finally {
-      clearInterval(_progressInterval);
-    }
+  try {
+    console.log(`[API] Iniciando descarga: ${fechaInicio} a ${fechaFin} | grupo: ${grupo || 'todos'} | módulos: ${modulos.join(',')}`);
+    avisar({ fase: 'conectando', n: 0, total: 0 });
+
+    const { documentos, nit, filasEncontradas, sinArchivo } = await descargarDIAN({
+      tokenUrl, fechaInicio, fechaFin, grupo, soloXML, onProgreso: avisar,
+    });
 
     if (documentos.length === 0) {
-      emitProgreso({ fase: 'idle', n: 0, total: 0 });
-      return res.json({
-        ok: true, total: 0, filas: [], facturas: [],
+      avisar({ fase: 'idle', n: 0, total: 0 });
+      return {
+        ok: true, nit, total: 0, filas: [], facturas: 0, items: 0, facturas_data: [],
         mensaje: 'No se encontraron documentos en el período indicado',
-      });
+      };
+    }
+    if (sinArchivo === documentos.length) {
+      throw new Error('Se encontraron ' + documentos.length + ' documentos en la DIAN pero no se pudo descargar ninguno (revisar logs del servidor).');
     }
 
-    emitProgreso({ fase: 'procesando', n: documentos.length, total: documentos.length });
+    avisar({ fase: 'procesando', n: documentos.length, total: documentos.length });
 
     // 2. Parsear XMLs
     const xmlTexts = documentos.map(d => ({
@@ -132,12 +166,14 @@ router.post('/descargar', async (req, res) => {
       }
     }
 
-    emitProgreso({ fase: 'listo', n: documentos.length, total: documentos.length, zipKey });
+    avisar({ fase: 'listo', n: documentos.length, total: documentos.length, zipKey });
 
-    res.json({
+    return {
       ok: true,
       nit,
       total: documentos.length,
+      filasEncontradas,
+      sinArchivo,
       facturas: facturas.length,
       items: filas.length,
       filas,
@@ -146,14 +182,12 @@ router.post('/descargar', async (req, res) => {
       zipKey,
       periodo: { desde: fechaInicio, hasta: fechaFin },
       empresa,
-    });
-
+    };
   } catch (err) {
-    console.error('[API] Error en descarga:', err.message);
-    emitProgreso({ fase: 'error', error: err.message });
-    res.status(500).json({ ok: false, error: err.message });
+    avisar({ fase: 'error', error: err.message });
+    throw err;
   }
-});
+}
 
 /**
  * POST /api/dian/excel-items
