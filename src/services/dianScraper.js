@@ -564,12 +564,27 @@ const TIPOS_OMITIR = /application\s*response|acuse/i;
 
 function normcol(s) { return String(s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase(); }
 
+/** Lee un archivo subido (xlsx suelto o ZIP que contiene el xlsx) -> lista de documentos. */
+async function docsDesdeArchivo(buffer) {
+  let xlsxBuf = buffer;
+  try {
+    const zip = await JSZip.loadAsync(buffer);
+    const entry = Object.keys(zip.files).find(function (n) { return n.toLowerCase().endsWith('.xlsx'); });
+    if (entry) xlsxBuf = await zip.files[entry].async('nodebuffer'); // era un ZIP con el xlsx dentro
+  } catch (e) { /* no era zip; se asume xlsx directo */ }
+  return docsDesdeXlsxBuffer(xlsxBuf);
+}
+
 /** Convierte el ZIP exportado (con el .xlsx dentro) en la lista de documentos. */
-async function docsDesdeExportZip(zipBuffer, nit) {
+async function docsDesdeExportZip(zipBuffer) {
   const zip = await JSZip.loadAsync(zipBuffer);
   const nombre = Object.keys(zip.files).find(function (n) { return n.toLowerCase().endsWith('.xlsx'); });
   if (!nombre) throw new Error('El ZIP exportado no trae .xlsx');
-  const buf = await zip.files[nombre].async('nodebuffer');
+  return docsDesdeXlsxBuffer(await zip.files[nombre].async('nodebuffer'));
+}
+
+/** Convierte el contenido de un .xlsx (Buffer) en la lista de documentos. */
+function docsDesdeXlsxBuffer(buf) {
   const wb = XLSX.read(buf, { type: 'buffer' });
   const ws = wb.Sheets[wb.SheetNames[0]];
   const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false });
@@ -690,7 +705,7 @@ async function listarViaExport(page, nit, desde, hasta) {
 }
 
 // ── Función principal ─────────────────────────────────────────
-async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloXML = false, soloListar = false, onProgreso }) {
+async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloXML = false, soloListar = false, documentosPrecargados = null, onProgreso }) {
   const { nit, token, pk } = parseTokenUrl(tokenUrl);
   const dias = Math.round((new Date(fechaFin + 'T00:00:00') - new Date(fechaInicio + 'T00:00:00')) / 86400000);
   const rangos = dias > 31 ? dividirEnMeses(fechaInicio, fechaFin) : [{ desde: fechaInicio, hasta: fechaFin }];
@@ -730,12 +745,17 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloXML =
     };
 
     let viaExport = null;
-    try { viaExport = await listarViaExport(page, nit, fechaInicio, fechaFin); }
-    catch (e) { console.log('[EXPORT] Error: ' + e.message); }
+    if (documentosPrecargados && documentosPrecargados.length) {
+      viaExport = documentosPrecargados; // lista subida por el usuario (Excel del listado)
+      console.log('[LISTADO] Documentos precargados desde archivo: ' + documentosPrecargados.length);
+    } else {
+      try { viaExport = await listarViaExport(page, nit, fechaInicio, fechaFin); }
+      catch (e) { console.log('[EXPORT] Error: ' + e.message); }
+    }
 
     if (viaExport && viaExport.length) {
       viaExport.forEach(function (f) { agregar(f, f.grupo); });
-      console.log('[DIAN] TOTAL documentos (export): ' + todos.length);
+      console.log('[DIAN] TOTAL documentos (lista): ' + todos.length);
     } else {
       console.log('[DIAN] Export no disponible; usando rastreo por grupo.');
       for (const g of grupos) {
@@ -837,5 +857,5 @@ async function diagnosticarPortal(tokenUrl) {
 module.exports = {
   descargarDIAN, diagnosticarPortal, parseTokenUrl,
   // para pruebas
-  ajustarPayload, formatearComo, fechaAISO, dividirEnMeses, parsearFilasAjax, docsDesdeExportZip,
+  ajustarPayload, formatearComo, fechaAISO, dividirEnMeses, parsearFilasAjax, docsDesdeExportZip, docsDesdeArchivo,
 };
