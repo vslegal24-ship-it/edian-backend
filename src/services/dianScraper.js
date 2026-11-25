@@ -1,5 +1,6 @@
 const { chromium } = require('playwright');
 const JSZip = require('jszip');
+const XLSX = require('xlsx');
 const fs = require('fs');
 
 /*
@@ -554,6 +555,142 @@ async function descargarDocumentoClick(page, id) {
   }
 }
 
+// ── Listar por la exportación oficial ("Descargar listados") ──
+const LISTADOS_URLS = [
+  BASE + '/Document/DownloadList',
+  BASE + '/Document/ExportDocuments',
+  BASE + '/Document/DownloadDocuments',
+];
+// Tipos que no tienen archivo para descargar (acuses de recibo, etc.)
+const TIPOS_OMITIR = /application\s*response|acuse/i;
+
+function normcol(s) { return String(s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase(); }
+
+/** Convierte el ZIP exportado (con el .xlsx dentro) en la lista de documentos. */
+async function docsDesdeExportZip(zipBuffer, nit) {
+  const zip = await JSZip.loadAsync(zipBuffer);
+  const nombre = Object.keys(zip.files).find(function (n) { return n.toLowerCase().endsWith('.xlsx'); });
+  if (!nombre) throw new Error('El ZIP exportado no trae .xlsx');
+  const buf = await zip.files[nombre].async('nodebuffer');
+  const wb = XLSX.read(buf, { type: 'buffer' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false });
+  if (!rows.length) return [];
+  const H = rows[0].map(function (x) { return normcol(x); });
+  const col = function (re) { return H.findIndex(function (h) { return re.test(h); }); };
+  const iCufe = col(/cufe|cude/), iTipo = col(/tipo de documento/), iFolio = col(/folio/), iPref = col(/prefijo/),
+    iFecha = col(/fecha emis/), iNitE = col(/nit emisor/), iNomE = col(/nombre emisor/),
+    iNitR = col(/nit receptor/), iNomR = col(/nombre receptor/), iTot = col(/^total$/), iGrupo = col(/grupo/);
+  if (iCufe < 0) throw new Error('El Excel exportado no tiene columna CUFE/CUDE');
+  const docs = [];
+  let omitidos = 0;
+  for (const r of rows.slice(1)) {
+    const cufe = String(r[iCufe] || '').trim();
+    if (cufe.length < 40) continue;
+    const tipo = iTipo >= 0 ? String(r[iTipo] || '') : '';
+    if (TIPOS_OMITIR.test(tipo)) { omitidos++; continue; }
+    const folio = iFolio >= 0 ? String(r[iFolio] || '') : '';
+    const prefijo = iPref >= 0 ? String(r[iPref] || '') : '';
+    docs.push({
+      id: cufe, cufe: cufe, partitionKey: '',
+      tipo: tipo || 'Factura electronica',
+      fecha: fechaAISO(iFecha >= 0 ? r[iFecha] : '') || (iFecha >= 0 ? String(r[iFecha] || '') : ''),
+      prefijo: prefijo, folio: folio,
+      nombre: (prefijo ? prefijo + '-' : '') + folio,
+      nitEmisor: iNitE >= 0 ? String(r[iNitE] || '') : '',
+      nomEmisor: iNomE >= 0 ? String(r[iNomE] || '') : '',
+      nitReceptor: iNitR >= 0 ? String(r[iNitR] || '') : '',
+      nomReceptor: iNomR >= 0 ? String(r[iNomR] || '') : '',
+      total: iTot >= 0 ? (parseFloat(String(r[iTot]).replace(/[^0-9.-]/g, '')) || 0) : 0,
+      estado: '', grupo: (iGrupo >= 0 && /emit/i.test(String(r[iGrupo]))) ? 'Emitido' : 'Recibido',
+    });
+  }
+  if (omitidos) console.log('[EXPORT] Omitidos ' + omitidos + ' acuses (Application response)');
+  return docs;
+}
+
+/** Genera la exportación en catalogo, la descarga y la convierte en lista de documentos. null si no se logra. */
+async function listarViaExport(page, nit, desde, hasta) {
+  // 1) Abrir la página "Descargar listados"
+  let enPagina = false;
+  for (const u of LISTADOS_URLS) {
+    try {
+      await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      if (!/\/login/i.test(page.url())) {
+        const hayBoton = await page.evaluate(function () {
+          return Array.from(document.querySelectorAll('button,a,input')).some(function (b) { return /exportar\s*excel/i.test((b.textContent || '') + (b.value || '')); });
+        }).catch(function () { return false; });
+        if (hayBoton) { enPagina = true; console.log('[EXPORT] Página de listados: ' + u); break; }
+      }
+    } catch (e) {}
+  }
+  if (!enPagina) {
+    // intentar por el menú
+    await page.goto(BASE + '/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(function () {});
+    await page.evaluate(function () {
+      var m = document.querySelector('[class*="hamburg"],[class*="menu-toggle"],.navbar-toggler,[class*="bars"]'); if (m) (m.closest('a,button') || m).click();
+    }).catch(function () {});
+    await page.waitForTimeout(600);
+    const nav = page.waitForNavigation({ timeout: 8000 }).catch(function () { return null; });
+    await page.evaluate(function () {
+      var els = Array.from(document.querySelectorAll('a,button,span,li,div'));
+      for (var i = 0; i < els.length; i++) { var t = (els[i].textContent || '').trim(); if (/descargar\s*listados|^listados$/i.test(t) && t.length < 40) { els[i].click(); return; } }
+    }).catch(function () {});
+    await nav;
+    await page.waitForTimeout(1500);
+    enPagina = await page.evaluate(function () {
+      return Array.from(document.querySelectorAll('button,a,input')).some(function (b) { return /exportar\s*excel/i.test((b.textContent || '') + (b.value || '')); });
+    }).catch(function () { return false; });
+    console.log('[EXPORT] Página de listados por menú: ' + (enPagina ? page.url() : 'no encontrada'));
+  }
+  if (!enPagina) { console.log('[EXPORT] No se encontró la página "Descargar listados".'); return null; }
+
+  // 2) Links de export existentes antes de generar (para detectar el nuevo)
+  const previos = await page.evaluate(function () {
+    return Array.from(document.querySelectorAll('a[href*="DownloadExportedZipFile"]')).map(function (a) { return a.href; });
+  }).catch(function () { return []; });
+
+  // 3) Fijar fechas + Grupos=Todos y pulsar "Exportar Excel"
+  await page.evaluate(function (p) {
+    function setFecha(el, v) { if (!el) return; el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+    // daterangepicker: input visible con "desde - hasta"
+    var rango = document.querySelector('#dashboard-report-range, input[name*="range" i], input[id*="range" i], input[id*="fecha" i]');
+    setFecha(rango, p.desde + ' - ' + p.hasta);
+    setFecha(document.getElementById('startDate'), p.desde);
+    setFecha(document.getElementById('endDate'), p.hasta);
+    try { if (window.$ && $(rango).data) { var dr = $(rango).data('daterangepicker'); if (dr) { dr.setStartDate(p.desde); dr.setEndDate(p.hasta); } } } catch (e) {}
+    // Grupos = Todos
+    var sel = document.querySelector('select[id*="grupo" i], select[name*="grupo" i]');
+    if (sel) { for (var i = 0; i < sel.options.length; i++) { if (/todos/i.test(sel.options[i].textContent)) { sel.selectedIndex = i; sel.dispatchEvent(new Event('change', { bubbles: true })); break; } } }
+  }, { desde, hasta }).catch(function () {});
+  await page.waitForTimeout(500);
+  await page.evaluate(function () {
+    var b = Array.from(document.querySelectorAll('button,a,input')).find(function (x) { return /exportar\s*excel/i.test((x.textContent || '') + (x.value || '')); });
+    if (b) b.click();
+  }).catch(function () {});
+  console.log('[EXPORT] Exportación solicitada: ' + desde + '..' + hasta);
+
+  // 4) Esperar a que aparezca un link de export NUEVO (hasta ~2 min)
+  let nuevo = null;
+  for (let i = 0; i < 48 && !nuevo; i++) {
+    await page.waitForTimeout(2500);
+    try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }); } catch (e) {}
+    nuevo = await page.evaluate(function (prev) {
+      var links = Array.from(document.querySelectorAll('a[href*="DownloadExportedZipFile"]')).map(function (a) { return a.href; });
+      return links.find(function (h) { return prev.indexOf(h) < 0; }) || null;
+    }, previos).catch(function () { return null; });
+  }
+  if (!nuevo) { console.log('[EXPORT] La exportación no quedó lista a tiempo.'); return null; }
+  console.log('[EXPORT] Exportación lista: ' + nuevo.substring(0, 110));
+
+  // 5) Descargar el ZIP y leer el Excel
+  const r = await bajarEnPagina(page, nuevo);
+  if (!r || !r.zipB64) { console.log('[EXPORT] No se pudo descargar el ZIP: ' + JSON.stringify(r).substring(0, 200)); return null; }
+  const docs = await docsDesdeExportZip(Buffer.from(r.zipB64, 'base64'), nit);
+  console.log('[EXPORT] Documentos leídos del Excel: ' + docs.length);
+  return docs;
+}
+
 // ── Función principal ─────────────────────────────────────────
 async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloXML = false, soloListar = false, onProgreso }) {
   const { nit, token, pk } = parseTokenUrl(tokenUrl);
@@ -580,28 +717,42 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloXML =
     progreso('conectando', 0, 0);
     await autenticar(context, page, pk, nit, token);
 
-    // FASE 1: listar
-    const todos = [], vistos = {};
-    for (const g of grupos) {
-      const captura = await capturarConsulta(page, PAGINAS[g]);
-      for (const rango of rangos) {
-        let filas = captura ? await consultarRango(page, captura, rango.desde, rango.hasta) : null;
-        if (filas == null) filas = await consultarRangoViaTabla(page, PAGINAS[g], rango.desde, rango.hasta);
-        let nuevos = 0;
-        filas.forEach(function (f) {
-          if (vistos[f.id]) return;
-          vistos[f.id] = true; nuevos++;
-          todos.push(Object.assign({}, f, {
-            grupo: g,
-            cufeUrl: BASE + '/document/searchqr?documentkey=' + f.cufe,
-            nitReceptor: f.nitReceptor || (g === 'Recibido' ? nit : ''),
-            rangoDesde: rango.desde, rangoHasta: rango.hasta,
-          }));
-        });
-        console.log('[DIAN] ' + g + ' ' + rango.desde + '..' + rango.hasta + ': ' + filas.length + ' docs (' + nuevos + ' nuevos)');
+    // FASE 1: listar — primero por la exportación oficial (rápida); si falla, rastreo por grupo
+    let todos = [];
+    const vistos = {};
+    const agregar = function (f, g) {
+      if (vistos[f.id]) return;
+      vistos[f.id] = true;
+      todos.push(Object.assign({}, f, {
+        grupo: g || f.grupo,
+        cufeUrl: BASE + '/document/searchqr?documentkey=' + f.cufe,
+        nitReceptor: f.nitReceptor || ((g || f.grupo) === 'Recibido' ? nit : ''),
+        rangoDesde: fechaInicio, rangoHasta: fechaFin,
+      }));
+    };
+
+    let viaExport = null;
+    try { viaExport = await listarViaExport(page, nit, fechaInicio, fechaFin); }
+    catch (e) { console.log('[EXPORT] Error: ' + e.message); }
+
+    if (viaExport && viaExport.length) {
+      viaExport.forEach(function (f) { agregar(f, f.grupo); });
+      console.log('[DIAN] TOTAL documentos (export): ' + todos.length);
+    } else {
+      console.log('[DIAN] Export no disponible; usando rastreo por grupo.');
+      for (const g of grupos) {
+        const captura = await capturarConsulta(page, PAGINAS[g]);
+        for (const rango of rangos) {
+          let filas = captura ? await consultarRango(page, captura, rango.desde, rango.hasta) : null;
+          if (filas == null) filas = await consultarRangoViaTabla(page, PAGINAS[g], rango.desde, rango.hasta);
+          filas = filas.filter(function (f) { return !TIPOS_OMITIR.test(f.tipo || ''); });
+          const antes = todos.length;
+          filas.forEach(function (f) { f.rangoDesde = rango.desde; f.rangoHasta = rango.hasta; agregar(f, g); });
+          console.log('[DIAN] ' + g + ' ' + rango.desde + '..' + rango.hasta + ': ' + filas.length + ' docs (' + (todos.length - antes) + ' nuevos)');
+        }
       }
+      console.log('[DIAN] TOTAL documentos: ' + todos.length);
     }
-    console.log('[DIAN] TOTAL documentos: ' + todos.length);
     if (soloListar) {
       progreso('listo', todos.length, todos.length);
       return { documentos: todos, nit, total: todos.length, filasEncontradas: todos.length, sinArchivo: 0 };
@@ -688,5 +839,5 @@ async function diagnosticarPortal(tokenUrl) {
 module.exports = {
   descargarDIAN, diagnosticarPortal, parseTokenUrl,
   // para pruebas
-  ajustarPayload, formatearComo, fechaAISO, dividirEnMeses, parsearFilasAjax,
+  ajustarPayload, formatearComo, fechaAISO, dividirEnMeses, parsearFilasAjax, docsDesdeExportZip,
 };
