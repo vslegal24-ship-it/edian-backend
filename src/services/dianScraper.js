@@ -409,7 +409,7 @@ async function descargarDocumentoClick(page, id) {
 }
 
 // ── Función principal ─────────────────────────────────────────
-async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloXML = false, onProgreso }) {
+async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloXML = false, soloListar = false, onProgreso }) {
   const { nit, token, pk } = parseTokenUrl(tokenUrl);
   const dias = Math.round((new Date(fechaFin + 'T00:00:00') - new Date(fechaInicio + 'T00:00:00')) / 86400000);
   const rangos = dias > 31 ? dividirEnMeses(fechaInicio, fechaFin) : [{ desde: fechaInicio, hasta: fechaFin }];
@@ -456,6 +456,10 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloXML =
       }
     }
     console.log('[DIAN] TOTAL documentos: ' + todos.length);
+    if (soloListar) {
+      progreso('listo', todos.length, todos.length);
+      return { documentos: todos, nit, total: todos.length, filasEncontradas: todos.length, sinArchivo: 0 };
+    }
     progreso('descargando', 0, todos.length);
 
     // FASE 2: descargar directo, en paralelo
