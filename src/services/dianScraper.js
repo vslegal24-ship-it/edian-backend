@@ -388,6 +388,50 @@ async function extraerZip(buffer) {
   return { pdfBuffer, xmlBuffer, xmlText };
 }
 
+/** Entra a la Solución Gratuita por el menú de catalogo (clic en "Solución Gratuita → Ingreso").
+ *  La sesión queda en las cookies del contexto (compartidas por todas las pestañas). */
+async function ssoDesdeMenu(context, pk, nit, token) {
+  const p = await context.newPage();
+  let ssoUrl = null;
+  const vistos = [];
+  p.on('request', function (req) { const u = req.url(); if (u.indexOf('gratis-vpfe') >= 0) { if (!ssoUrl) ssoUrl = u; if (vistos.length < 8) vistos.push(req.method() + ' ' + u.substring(0, 110)); } });
+  const onPop = async function (pop) { try { await pop.waitForLoadState('domcontentloaded', { timeout: 8000 }); if (!ssoUrl && pop.url().indexOf('gratis-vpfe') >= 0) ssoUrl = pop.url(); } catch (e) {} };
+  context.on('page', onPop);
+  try {
+    await autenticar(context, p, pk, nit, token, BASE);
+    await p.goto(BASE + '/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await p.waitForTimeout(1500);
+    // Abrir el menú lateral y desplegar "Solución Gratuita"
+    await p.evaluate(function () {
+      function clic(re) {
+        var els = Array.from(document.querySelectorAll('a,button,span,li,div'));
+        for (var i = 0; i < els.length; i++) { var t = (els[i].textContent || '').trim(); if (t.length < 40 && re.test(t)) { els[i].click(); return true; } }
+        return false;
+      }
+      var m = document.querySelector('[class*="hamburg"],[class*="menu-toggle"],button[aria-label*="men" i],.navbar-toggler');
+      if (m) m.click();
+      clic(/soluci.n\s+gratuita/i);
+    }).catch(function () {});
+    await p.waitForTimeout(1500);
+    // Clic en "Ingreso" (abre gratis-vpfe por SSO, en esta pestaña o en una nueva)
+    const navEgt = p.waitForNavigation({ timeout: 8000 }).catch(function () { return null; });
+    await p.evaluate(function () {
+      var els = Array.from(document.querySelectorAll('a,button,span,li,div'));
+      for (var i = 0; i < els.length; i++) { var t = (els[i].textContent || '').trim(); if (/^ingreso$/i.test(t)) { els[i].click(); return; } }
+    }).catch(function () {});
+    await navEgt;
+    for (let i = 0; i < 20 && !ssoUrl; i++) await p.waitForTimeout(500);
+    if (!ssoUrl && p.url().indexOf('gratis-vpfe') >= 0) ssoUrl = p.url();
+    console.log('[GRATIS] Menú -> peticiones a gratis-vpfe: ' + (vistos.length ? vistos.join(' | ') : 'ninguna'));
+  } catch (e) {
+    console.log('[GRATIS] ssoDesdeMenu error: ' + e.message);
+  } finally {
+    context.off('page', onPop);
+    await p.close().catch(function () {});
+  }
+  return ssoUrl;
+}
+
 /** Abre una pestaña autenticada en gratis-vpfe. Devuelve la página o null si no se logra. */
 async function abrirGratis(context, catalogoPage, pk, nit, token, docPrueba, soloXML) {
   if (!docPrueba) return null;
@@ -396,28 +440,21 @@ async function abrirGratis(context, catalogoPage, pk, nit, token, docPrueba, sol
     page = await context.newPage();
     // Estrategia A: el mismo token directamente en gratis-vpfe
     try { await autenticar(context, page, pk, nit, token, GRATIS); } catch (e) { console.log('[GRATIS] AuthToken directo: ' + e.message); }
-    if (await descargarGratis(page, docPrueba, soloXML)) {
-      console.log('[GRATIS] Sesión OK (token directo): XML' + (soloXML ? '' : ' + PDF') + ' desde la Solución Gratuita.');
+    if (page.url().indexOf('AuthToken') < 0 && await descargarGratis(page, docPrueba, soloXML)) {
+      console.log('[GRATIS] Sesión OK (token directo): XML' + (soloXML ? '' : ' + PDF') + '.');
       return page;
     }
-    // Estrategia B: entrar por el enlace del menú "Solución Gratuita / Ingreso" (SSO desde catalogo)
+    // Estrategia B: SSO desde el menú "Solución Gratuita → Ingreso"
     estadoGratis.diagnosticado = false;
-    const hrefs = await catalogoPage.evaluate(function () {
-      return Array.from(document.querySelectorAll('a[href]'))
-        .filter(function (a) { return a.href.indexOf('gratis-vpfe') >= 0 || /ingreso|soluci.n gratuita/i.test(a.textContent || ''); })
-        .map(function (a) { return a.href; });
-    }).catch(function () { return []; });
-    for (const href of hrefs) {
-      try {
-        await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 40000 });
-        await page.waitForTimeout(2500);
-        if (await descargarGratis(page, docPrueba, soloXML)) {
-          console.log('[GRATIS] Sesión OK (menú Solución Gratuita): ' + href.substring(0, 90));
-          return page;
-        }
-      } catch (e) {}
+    const sso = await ssoDesdeMenu(context, pk, nit, token);
+    const destino = sso || (GRATIS + '/');
+    await page.goto(destino, { waitUntil: 'domcontentloaded', timeout: 40000 }).catch(function () {});
+    await page.waitForTimeout(2000);
+    if (await descargarGratis(page, docPrueba, soloXML)) {
+      console.log('[GRATIS] Sesión OK (menú Solución Gratuita): XML' + (soloXML ? '' : ' + PDF') + '.');
+      return page;
     }
-    console.log('[GRATIS] No se pudo descargar desde gratis-vpfe (enlaces probados: ' + hrefs.length + '); se usará el método normal.');
+    console.log('[GRATIS] No se pudo descargar desde gratis-vpfe' + (sso ? ' (SSO: ' + sso.substring(0, 90) + ')' : ' (sin SSO)') + '; se usará el método normal.');
     await page.close().catch(function () {});
     return null;
   } catch (e) {
