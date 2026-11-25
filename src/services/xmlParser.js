@@ -18,7 +18,16 @@ async function parseXmlDIAN(xmlText) {
     attrNameProcessors: [xml2js.processors.stripPrefix],
   });
 
-  const doc = await parser.parseStringPromise(xmlText);
+  let doc = await parser.parseStringPromise(xmlText);
+
+  // El ZIP de la DIAN trae un AttachedDocument con la factura embebida (CDATA)
+  if (doc.AttachedDocument) {
+    const ext = doc.AttachedDocument.Attachment && doc.AttachedDocument.Attachment.ExternalReference;
+    const desc = ext && ext.Description;
+    const interno = typeof desc === 'object' && desc !== null ? (desc._ || desc['#text'] || '') : (desc || '');
+    if (!interno || !String(interno).includes('<')) throw new Error('AttachedDocument sin factura embebida');
+    doc = await parser.parseStringPromise(String(interno).trim());
+  }
 
   // Root puede ser Invoice, CreditNote, DebitNote
   const root = doc.Invoice || doc.CreditNote || doc.DebitNote;
