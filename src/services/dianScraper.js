@@ -13,6 +13,7 @@ const fs = require('fs');
  */
 
 const BASE = 'https://catalogo-vpfe.dian.gov.co';
+const GRATIS = 'https://gratis-vpfe.dian.gov.co'; // Solución Gratuita: DownloadXml da el XML sin captcha
 const PAGINAS = {
   Recibido:       BASE + '/Document/Received',
   Emitido:        BASE + '/Document/Sent',
@@ -87,9 +88,10 @@ function fechaAISO(v) {
   return '';
 }
 
-async function autenticar(context, page, pk, nit, token) {
-  console.log('[DIAN] Autenticando NIT ' + nit);
-  await page.goto(BASE + '/User/AuthToken?pk=' + pk + '&rk=' + nit + '&token=' + token,
+async function autenticar(context, page, pk, nit, token, base) {
+  base = base || BASE;
+  console.log('[DIAN] Autenticando NIT ' + nit + ' en ' + base);
+  await page.goto(base + '/User/AuthToken?pk=' + pk + '&rk=' + nit + '&token=' + token,
     { waitUntil: 'domcontentloaded', timeout: 40000 });
   await page.waitForTimeout(3000);
   if (page.url().includes('AuthToken')) {
@@ -331,16 +333,48 @@ async function bajarEnPagina(page, url) {
     try {
       var r = await fetch(u, { credentials: 'include' });
       var buf = new Uint8Array(await r.arrayBuffer());
-      if (r.ok && buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4B) {
-        var s = '';
-        for (var i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-        return { zipB64: btoa(s) };
+      if (!r.ok) {
+        var h0 = ''; try { h0 = new TextDecoder().decode(buf.subarray(0, 300)); } catch (e) {}
+        return { status: r.status, tipo: r.headers.get('content-type') || '', head: h0.replace(/\s+/g, ' ') };
       }
-      var head = '';
-      try { head = new TextDecoder().decode(buf.subarray(0, 300)); } catch (e) {}
-      return { status: r.status, tipo: r.headers.get('content-type') || '', head: head.replace(/\s+/g, ' ') };
+      var b64 = function (b) { var s = ''; for (var i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); };
+      // ZIP (empieza con "PK")
+      if (buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4B) return { zipB64: b64(buf) };
+      // PDF (empieza con "%PDF")
+      if (buf.length > 4 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) return { pdfB64: b64(buf) };
+      // XML directo (DownloadXml de la Solución Gratuita)
+      var txt = ''; try { txt = new TextDecoder().decode(buf); } catch (e) {}
+      if (/<\?xml|<AttachedDocument|<Invoice|<CreditNote|<DebitNote/i.test(txt.substring(0, 500))) {
+        return { xmlText: txt };
+      }
+      return { status: r.status, tipo: r.headers.get('content-type') || '', head: txt.substring(0, 300).replace(/\s+/g, ' ') };
     } catch (e) { return { error: e.message }; }
   }, url);
+}
+
+const estadoGratis = { diagnosticado: false, type: null };
+
+/** Descarga XML (y PDF, si no es soloXML) desde la Solución Gratuita usando el CUFE. */
+async function descargarGratis(page, doc, soloXML) {
+  if (!page) return null;
+  let xml = null;
+  const tipos = estadoGratis.type != null ? [estadoGratis.type, 2, 1, 3] : [2, 1, 3];
+  for (const type of tipos) {
+    const r = await bajarEnPagina(page, GRATIS + '/Document/DownloadXml?transactionId=' + encodeURIComponent(doc.cufe) + '&type=' + type);
+    if (r && r.xmlText && r.xmlText.indexOf('<') >= 0) { xml = { xmlBuffer: Buffer.from(r.xmlText, 'utf8'), xmlText: r.xmlText }; estadoGratis.type = type; break; }
+    if (r && r.zipB64) { try { const z = await extraerZip(Buffer.from(r.zipB64, 'base64')); if (z.xmlText) { xml = z; estadoGratis.type = type; break; } } catch (e) {} }
+    if (!estadoGratis.diagnosticado) {
+      estadoGratis.diagnosticado = true;
+      console.log('[GRATIS] DownloadXml type=' + type + ' para ' + doc.nombre + ' -> ' + JSON.stringify(r).substring(0, 220));
+    }
+  }
+  if (!xml) return null;
+  let pdfBuffer = xml.pdfBuffer || null;
+  if (!soloXML && !pdfBuffer) {
+    const rp = await bajarEnPagina(page, GRATIS + '/IoFacturo/Print/PrintStoragePdf?transactionId=' + encodeURIComponent(doc.cufe) + '&viewMode=attachment');
+    if (rp && rp.pdfB64) pdfBuffer = Buffer.from(rp.pdfB64, 'base64');
+  }
+  return { pdfBuffer, xmlBuffer: xml.xmlBuffer, xmlText: xml.xmlText };
 }
 
 async function extraerZip(buffer) {
@@ -352,6 +386,45 @@ async function extraerZip(buffer) {
     if (low.endsWith('.xml') && !xmlBuffer) { xmlBuffer = await file.async('nodebuffer'); xmlText = xmlBuffer.toString('utf8'); }
   }
   return { pdfBuffer, xmlBuffer, xmlText };
+}
+
+/** Abre una pestaña autenticada en gratis-vpfe. Devuelve la página o null si no se logra. */
+async function abrirGratis(context, catalogoPage, pk, nit, token, docPrueba, soloXML) {
+  if (!docPrueba) return null;
+  let page = null;
+  try {
+    page = await context.newPage();
+    // Estrategia A: el mismo token directamente en gratis-vpfe
+    try { await autenticar(context, page, pk, nit, token, GRATIS); } catch (e) { console.log('[GRATIS] AuthToken directo: ' + e.message); }
+    if (await descargarGratis(page, docPrueba, soloXML)) {
+      console.log('[GRATIS] Sesión OK (token directo): XML' + (soloXML ? '' : ' + PDF') + ' desde la Solución Gratuita.');
+      return page;
+    }
+    // Estrategia B: entrar por el enlace del menú "Solución Gratuita / Ingreso" (SSO desde catalogo)
+    estadoGratis.diagnosticado = false;
+    const hrefs = await catalogoPage.evaluate(function () {
+      return Array.from(document.querySelectorAll('a[href]'))
+        .filter(function (a) { return a.href.indexOf('gratis-vpfe') >= 0 || /ingreso|soluci.n gratuita/i.test(a.textContent || ''); })
+        .map(function (a) { return a.href; });
+    }).catch(function () { return []; });
+    for (const href of hrefs) {
+      try {
+        await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 40000 });
+        await page.waitForTimeout(2500);
+        if (await descargarGratis(page, docPrueba, soloXML)) {
+          console.log('[GRATIS] Sesión OK (menú Solución Gratuita): ' + href.substring(0, 90));
+          return page;
+        }
+      } catch (e) {}
+    }
+    console.log('[GRATIS] No se pudo descargar desde gratis-vpfe (enlaces probados: ' + hrefs.length + '); se usará el método normal.');
+    await page.close().catch(function () {});
+    return null;
+  } catch (e) {
+    console.log('[GRATIS] Error abriendo gratis-vpfe: ' + e.message);
+    if (page) await page.close().catch(function () {});
+    return null;
+  }
 }
 
 const estadoDescarga = { patron: null, diagnosticado: false };
@@ -462,20 +535,30 @@ async function descargarDIAN({ tokenUrl, fechaInicio, fechaFin, grupo, soloXML =
     }
     progreso('descargando', 0, todos.length);
 
-    // FASE 2: descargar directo, en paralelo
+    // Intentar abrir sesión en la Solución Gratuita (gratis-vpfe) para bajar XML + PDF.
+    const gratisPage = await abrirGratis(context, page, pk, nit, token, todos[0], soloXML);
+
+    // FASE 2: descargar. Primero por gratis-vpfe (XML+PDF sin captcha); si no, por catalogo.
     const documentos = [], pendientes = [];
     let hechos = 0;
+    const bajarUno = async function (doc) {
+      if (gratisPage) {
+        const x = await descargarGratis(gratisPage, doc, soloXML);
+        if (x) return x;
+      }
+      return await descargarDocumento(page, doc);
+    };
     for (let i = 0; i < todos.length; i += DESCARGAS_PARALELAS) {
       const lote = todos.slice(i, i + DESCARGAS_PARALELAS);
-      const res = await Promise.all(lote.map(function (doc) { return descargarDocumento(page, doc); }));
+      const res = await Promise.all(lote.map(bajarUno));
       res.forEach(function (a, j) {
         if (a) documentos.push(Object.assign({}, lote[j], { pdfBuffer: soloXML ? null : a.pdfBuffer, xmlBuffer: a.xmlBuffer, xmlText: a.xmlText }));
         else pendientes.push(lote[j]);
       });
       hechos += lote.length;
       progreso('descargando', hechos, todos.length);
-      // Si la descarga directa no funciona con los primeros, no insistir.
-      if (estadoDescarga.patron == null && pendientes.length >= Math.min(todos.length, DESCARGAS_PARALELAS * 2)) {
+      // Si no hay gratis y la descarga directa tampoco funciona con los primeros, no insistir.
+      if (!gratisPage && estadoDescarga.patron == null && pendientes.length >= Math.min(todos.length, DESCARGAS_PARALELAS * 2)) {
         todos.slice(i + DESCARGAS_PARALELAS).forEach(function (d) { pendientes.push(d); });
         break;
       }
