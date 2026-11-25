@@ -557,9 +557,7 @@ async function descargarDocumentoClick(page, id) {
 
 // ── Listar por la exportación oficial ("Descargar listados") ──
 const LISTADOS_URLS = [
-  BASE + '/Document/DownloadList',
-  BASE + '/Document/ExportDocuments',
-  BASE + '/Document/DownloadDocuments',
+  BASE + '/Document/Export',
 ];
 // Tipos que no tienen archivo para descargar (acuses de recibo, etc.)
 const TIPOS_OMITIR = /application\s*response|acuse/i;
