@@ -10,6 +10,22 @@ const supabase = createClient(
 );
 const JWT_SECRET = process.env.JWT_SECRET || 'edian_jwt_secret_2025';
 
+// ── Módulos del sistema y plantillas de plan ──
+const MODULOS_TODOS = ['proceso','lotes','terceros','consulta-nit','conciliacion-banco','conciliacion-dian','bases','contabilizacion','siigo-probador'];
+const PLANTILLAS = {
+  free:    ['proceso','lotes','terceros','consulta-nit'],
+  basico:  ['proceso','lotes','terceros','consulta-nit'],
+  medio:   ['proceso','lotes','terceros','consulta-nit','conciliacion-banco','conciliacion-dian'],
+  premium: ['proceso','lotes','terceros','consulta-nit','conciliacion-banco','conciliacion-dian','bases','contabilizacion'],
+};
+// Devuelve los módulos permitidos de un usuario: su lista propia, o la plantilla de su plan.
+// 'siigo-probador' solo para admin.
+function modulosDe(u) {
+  if (u.rol === 'admin') return MODULOS_TODOS.slice();
+  const base = Array.isArray(u.modulos) ? u.modulos : (PLANTILLAS[u.plan_id] || PLANTILLAS.free);
+  return base.filter(m => m !== 'siigo-probador');
+}
+
 // ── Helpers ─────────────────────────────────────────────────
 async function getUsuario(email) {
   const { data, error } = await supabase
@@ -86,6 +102,8 @@ router.post('/login', async (req, res) => {
         nombre: usuario.nombre,
         rol: usuario.rol,
         plan: usuario.plan,
+        modulos: modulosDe(usuario),
+        limiteEmpresas: usuario.limite_empresas || 1,
         nitsAsignados: usuario.nits_asignados || [],
         consultasRegalo: usuario.consultas_regalo || 0,
         consultasHoy,
@@ -108,7 +126,7 @@ router.post('/verificar', async (req, res) => {
     const usuario = await getUsuario(payload.email);
     if (!usuario || !usuario.activo) return res.status(401).json({ error: 'Sesión inválida' });
     const consultasHoy = await contarConsultasHoy(usuario.id);
-    res.json({ ok: true, usuario: { ...usuario, consultasHoy } });
+    res.json({ ok: true, usuario: { ...usuario, modulos: modulosDe(usuario), limiteEmpresas: usuario.limite_empresas || 1, consultasHoy } });
   } catch(e) {
     res.status(401).json({ error: 'Token inválido o expirado' });
   }
@@ -152,13 +170,15 @@ router.get('/usuarios', requireAdmin, async (req, res) => {
 
 // ── PUT /api/auth/usuarios/:id (solo admin) ──────────────────
 router.put('/usuarios/:id', requireAdmin, async (req, res) => {
-  const { activo, plan_id, fecha_vence, nits_asignados, consultas_regalo, password } = req.body;
+  const { activo, plan_id, fecha_vence, nits_asignados, consultas_regalo, password, modulos, limite_empresas } = req.body;
   const updates = {};
   if (activo !== undefined) updates.activo = activo;
   if (plan_id) updates.plan_id = plan_id;
   if (fecha_vence) updates.fecha_vence = fecha_vence;
   if (nits_asignados) updates.nits_asignados = nits_asignados;
   if (consultas_regalo !== undefined) updates.consultas_regalo = consultas_regalo;
+  if (modulos !== undefined) updates.modulos = modulos;
+  if (limite_empresas !== undefined) updates.limite_empresas = limite_empresas;
   if (password) updates.password_hash = await bcrypt.hash(password, 10);
   updates.updated_at = new Date().toISOString();
 
