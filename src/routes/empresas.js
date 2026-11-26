@@ -3,9 +3,17 @@ const express = require('express');
 const crypto  = require('crypto');
 const router  = express.Router();
 const { createClient } = require('@supabase/supabase-js');
+const jwt = require('jsonwebtoken');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const JWT_SECRET = process.env.JWT_SECRET || 'edian_jwt_secret_2025';
 const SIIGO = 'https://api.siigo.com';
+
+// Usuario del token (o null). payload: { id, email, rol, plan }
+function userFromReq(req) {
+  try { const t = (req.headers.authorization || '').replace('Bearer ', ''); return t ? jwt.verify(t, JWT_SECRET) : null; }
+  catch (e) { return null; }
+}
 
 // ── Cifrado AES-256-GCM de la Access Key ──
 function keyBuf() {
@@ -68,8 +76,14 @@ router.post('/guardar', async (req, res) => {
     catch (e) { return res.status(200).json({ ok: false, step: 'auth', message: 'No autenticó en Siigo: ' + e.message }); }
 
     // 2) Armar fila (cifrando la access key)
+    // Dueño: si entra un cliente (no admin), la empresa es suya; admin puede asignarla.
+    const tok = userFromReq(req);
+    let ownerId = b.usuario_id || null;
+    if (tok && tok.rol !== 'admin') ownerId = tok.id;
+    else if (tok && tok.rol === 'admin' && b.usuario_id) ownerId = b.usuario_id;
+
     const fila = {
-      usuario_id: b.usuario_id || null,
+      usuario_id: ownerId,
       nit: b.nit || null,
       dv: b.dv || null,
       nombre: b.nombre || b.usuario,
@@ -107,14 +121,28 @@ router.post('/guardar', async (req, res) => {
 // ── GET /api/empresas ── lista (SIN exponer la access key) ──
 router.get('/', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('edian_empresas')
-      .select('id, nit, nombre, siigo_usuario, siigo_partner_id, comprobante_fc_id, medio_pago_id, crear_terceros, sugerir_retenciones, last_puc_sync, last_aux_sync, activo, created_at')
+    const tok = userFromReq(req);
+    let q = supabase.from('edian_empresas')
+      .select('id, nit, nombre, siigo_usuario, siigo_partner_id, usuario_id, comprobante_fc_id, medio_pago_id, crear_terceros, sugerir_retenciones, last_puc_sync, last_aux_sync, activo, created_at')
       .eq('activo', true).order('created_at', { ascending: false });
+    // Cliente (no admin): solo sus empresas. Admin o sin token: todas.
+    if (tok && tok.rol !== 'admin') q = q.eq('usuario_id', tok.id);
+    const { data, error } = await q;
     if (error) throw error;
     res.json({ ok: true, empresas: data || [] });
   } catch (e) {
     res.status(500).json({ ok: false, message: e.message });
   }
+});
+
+// ── PUT /api/empresas/:id/asignar ── (admin: asigna la empresa a un usuario) ──
+router.put('/:id/asignar', async (req, res) => {
+  const tok = userFromReq(req);
+  if (!tok || tok.rol !== 'admin') return res.status(403).json({ ok: false, message: 'Solo admin' });
+  const { usuario_id } = req.body || {};
+  const { error } = await supabase.from('edian_empresas').update({ usuario_id: usuario_id || null }).eq('id', req.params.id);
+  if (error) return res.status(500).json({ ok: false, message: error.message });
+  res.json({ ok: true });
 });
 
 // ── DELETE /api/empresas/:id ── (desactiva) ──
