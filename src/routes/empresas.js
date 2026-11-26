@@ -9,10 +9,10 @@ const SIIGO = 'https://api.siigo.com';
 
 // ── Cifrado AES-256-GCM de la Access Key ──
 function keyBuf() {
-  const hex = process.env.SIIGO_ENC_KEY || '';
-  const b = Buffer.from(hex, 'hex');
-  if (b.length !== 32) throw new Error('SIIGO_ENC_KEY debe ser 64 caracteres hex (32 bytes).');
-  return b;
+  const raw = (process.env.SIIGO_ENC_KEY || '').trim();
+  if (!raw) throw new Error('Falta configurar SIIGO_ENC_KEY en el servidor.');
+  // Deriva una clave de 32 bytes de cualquier valor (robusto ante formato/espacios)
+  return crypto.createHash('sha256').update(raw).digest();
 }
 function cifrar(texto) {
   const iv = crypto.randomBytes(12);
