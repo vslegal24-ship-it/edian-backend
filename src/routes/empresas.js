@@ -126,6 +126,19 @@ router.delete('/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
 });
 
+// ── GET /api/empresas/diag ── diagnóstico (no expone valores) ──
+router.get('/diag', (req, res) => {
+  const v = process.env.SIIGO_ENC_KEY || '';
+  res.json({
+    ok: true,
+    enc_present: !!v.trim(),
+    enc_len: v.length,
+    claves_relacionadas: Object.keys(process.env).filter(k => /siigo|enc/i.test(k)),
+    supabase_url: !!process.env.SUPABASE_URL,
+    supabase_key: !!process.env.SUPABASE_SERVICE_KEY,
+  });
+});
+
 module.exports = router;
 module.exports.getCredenciales = getCredenciales;
 module.exports.cifrar = cifrar;
