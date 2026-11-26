@@ -7,6 +7,7 @@ const authRoutes  = require('./routes/auth');
 const boldRoutes  = require('./routes/bold');
 const nitRoutes   = require('./routes/nit');
 const siigoRoutes = require('./routes/siigo');
+const empresasRoutes = require('./routes/empresas');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -43,6 +44,7 @@ app.use('/api/auth',  authRoutes);
 app.use('/api/bold',  boldRoutes);
 app.use('/api/nit',   nitRoutes);
 app.use('/api/siigo', siigoRoutes);
+app.use('/api/empresas', empresasRoutes);
 
 // ── Error handler ───────────────────────────────────────────
 app.use((err, req, res, next) => {
