@@ -3,6 +3,7 @@
 // Siigo y consulta recursos para mostrar "qué trae" cada empresa.
 const express = require('express');
 const router  = express.Router();
+const { getCredenciales } = require('./empresas');
 
 const SIIGO = 'https://api.siigo.com';
 
@@ -61,7 +62,18 @@ function extraerLista(data) {
 // body: { usuario, accessKey, partnerId, recurso }
 //   recurso: una clave de RECURSOS, o "todo" para probar todas, o "auth" para solo login
 router.post('/probar', async (req, res) => {
-  const { usuario, accessKey, partnerId, recurso = 'auth' } = req.body || {};
+  let { usuario, accessKey, partnerId, recurso = 'auth', empresaId } = req.body || {};
+
+  // Si viene una empresa guardada, usamos sus credenciales (descifradas), sin reenviar la clave
+  if (empresaId) {
+    try {
+      const c = await getCredenciales(empresaId);
+      usuario = c.usuario; accessKey = c.accessKey; partnerId = c.partnerId;
+    } catch (e) {
+      return res.status(200).json({ ok: false, step: 'empresa', message: 'No se pudo cargar la empresa guardada: ' + e.message });
+    }
+  }
+
   if (!usuario || !accessKey) {
     return res.status(400).json({ ok: false, step: 'input', message: 'Faltan usuario (correo) o accessKey.' });
   }
