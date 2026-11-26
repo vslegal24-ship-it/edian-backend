@@ -6,6 +6,58 @@ const multer = require('multer');
 const subida = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 1000 } });
 const { generarExcelItems, generarExcelResumen } = require('../utils/excelGenerator');
 const JSZip = require('jszip');
+const jwt = require('jsonwebtoken');
+const { createClient } = require('@supabase/supabase-js');
+
+// ── Seguridad: cada proceso debe tener sesión y el NIT del token debe ser
+//    de una empresa contratada por ese usuario (evita usar el token con
+//    compañías no contratadas). El rol 'demo' procesa 1 NIT, 1 token y 1 mes. ──
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const JWT_SECRET = process.env.JWT_SECRET || 'edian_jwt_secret_2025';
+const soloDigitos = s => String(s || '').replace(/\D/g, '');
+
+async function guardProceso(req, body) {
+  body = body || {};
+  const raw = (req.headers.authorization || '').replace('Bearer ', '');
+  let payload = null;
+  try { payload = raw ? jwt.verify(raw, JWT_SECRET) : null; } catch (e) { payload = null; }
+  if (!payload) return { ok: false, status: 401, error: 'Debes iniciar sesión para procesar.' };
+  if (payload.rol === 'admin') return { ok: true };
+
+  let nitToken = '';
+  try { nitToken = soloDigitos(parseTokenUrl(body.tokenUrl).nit); } catch (e) {}
+  if (!nitToken) return { ok: false, status: 400, error: 'El enlace del token de la DIAN no es válido.' };
+
+  let rol = payload.rol, plan = payload.plan, demoUsado = false;
+  try {
+    const { data: u } = await supabase.from('edian_usuarios')
+      .select('rol, plan_id, demo_usado').eq('id', payload.id).single();
+    if (u) { rol = u.rol || rol; plan = u.plan_id || plan; demoUsado = !!u.demo_usado; }
+  } catch (e) {}
+
+  let nitsAsignados = [];
+  try {
+    const { data: emps } = await supabase.from('edian_empresas')
+      .select('nit').eq('usuario_id', payload.id).eq('activo', true);
+    nitsAsignados = (emps || []).map(e => soloDigitos(e.nit)).filter(Boolean);
+  } catch (e) {}
+
+  const esPremium = plan === 'premium';
+  if (!esPremium && !nitsAsignados.includes(nitToken)) {
+    return { ok: false, status: 403,
+      error: 'El NIT del token (' + nitToken + ') no coincide con ninguna de tus empresas contratadas. Pide a tu administrador que registre esa empresa.' };
+  }
+
+  if (rol === 'demo') {
+    if (demoUsado) return { ok: false, status: 403, error: 'Ya usaste tu prueba gratuita. Contáctanos para activar tu plan.' };
+    const a = String(body.fechaInicio || '').slice(0, 7), b = String(body.fechaFin || '').slice(0, 7);
+    if (a && b && a !== b) {
+      return { ok: false, status: 403, error: 'La prueba permite procesar un solo mes. Selecciona un rango dentro del mismo mes.' };
+    }
+    try { await supabase.from('edian_usuarios').update({ demo_usado: true }).eq('id', payload.id); } catch (e) {}
+  }
+  return { ok: true };
+}
 
 // Cache temporal de ZIPs generados (se limpian despues de 120 min)
 const zipCache = new Map();
@@ -62,6 +114,9 @@ router.post('/descargar', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'tokenUrl, fechaInicio y fechaFin son requeridos' });
   }
 
+  const g = await guardProceso(req, req.body);
+  if (!g.ok) return res.status(g.status).json({ ok: false, error: g.error });
+
   if (req.body.async) {
     const ocupado = [...jobs.values()].some(j => j.estado === 'procesando');
     if (ocupado) {
@@ -96,11 +151,13 @@ router.get('/job/:id', (req, res) => {
  * Solo busca en la DIAN (sin descargar). Responde { ok, jobId }; el resultado
  * (GET /job/:id) trae { documentos: [{cufe, nombre, fecha, nitEmisor, ...}] }.
  */
-router.post('/listar', (req, res) => {
+router.post('/listar', async (req, res) => {
   const { tokenUrl, fechaInicio, fechaFin, grupo = '' } = req.body;
   if (!tokenUrl || !fechaInicio || !fechaFin) {
     return res.status(400).json({ ok: false, error: 'tokenUrl, fechaInicio y fechaFin son requeridos' });
   }
+  const g = await guardProceso(req, req.body);
+  if (!g.ok) return res.status(g.status).json({ ok: false, error: g.error });
   if ([...jobs.values()].some(j => j.estado === 'procesando')) {
     return res.status(429).json({ ok: false, error: 'Ya hay un proceso en curso. Espera a que termine.' });
   }
@@ -135,6 +192,8 @@ router.post('/descargar-listado', subida.single('listado'), async (req, res) => 
     const { tokenUrl } = req.body;
     if (!tokenUrl) return res.status(400).json({ ok: false, error: 'Falta el token de la DIAN' });
     if (!req.file) return res.status(400).json({ ok: false, error: 'Falta el archivo del listado (Excel)' });
+    const g = await guardProceso(req, req.body);
+    if (!g.ok) return res.status(g.status).json({ ok: false, error: g.error });
     if ([...jobs.values()].some(j => j.estado === 'procesando')) {
       return res.status(429).json({ ok: false, error: 'Ya hay una descarga en curso. Espera a que termine.' });
     }
