@@ -34,6 +34,49 @@ function calcularDV(nit) {
 // Consulta individual — para el landing público y el módulo
 // Ejemplo: GET /api/nit/900373076
 // ══════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
+// GET /api/nit/rues/:nit — Consulta RUES (datos abiertos de datos.gov.co)
+// Trae matrícula mercantil, estado, cámara, representante legal, etc.
+// ══════════════════════════════════════════════════════════════
+router.get('/rues/:nit', async (req, res) => {
+  try {
+    const nit = String(req.params.nit || '').replace(/\D/g, '');
+    if (!nit || nit.length < 6 || nit.length > 12) {
+      return res.status(400).json({ success: false, message: 'NIT inválido. Debe tener entre 6 y 12 dígitos.' });
+    }
+    const url = `https://www.datos.gov.co/resource/c82u-588k.json?nit=${nit}`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    if (!r.ok) return res.status(502).json({ success: false, message: 'No se pudo consultar el RUES. Intenta de nuevo.' });
+    const arr = await r.json();
+    if (!Array.isArray(arr) || !arr.length) {
+      return res.status(404).json({ success: false, message: `No se encontró matrícula en el RUES para el NIT ${nit}.` });
+    }
+    const d = arr[0];
+    res.json({
+      success: true,
+      nit,
+      razon_social: d.razon_social || null,
+      sigla: d.sigla || null,
+      matricula: d.matricula || null,
+      camara_comercio: d.camara_comercio || null,
+      estado_matricula: d.estado_matricula || null,
+      categoria_matricula: d.categoria_matricula || null,
+      organizacion_juridica: d.organizacion_juridica || null,
+      tipo_sociedad: d.tipo_sociedad || null,
+      representante_legal: d.representante_legal || null,
+      actividad_economica: d.cod_ciiu_act_econ_pri || null,
+      fecha_matricula: d.fecha_matricula || null,
+      fecha_renovacion: d.fecha_renovacion || null,
+      ultimo_ano_renovado: d.ultimo_ano_renovado || null,
+      digito_verificacion: d.digito_verificacion || null
+    });
+  } catch (e) {
+    if (e.name === 'TimeoutError') return res.status(504).json({ success: false, message: 'La consulta al RUES tardó demasiado.' });
+    console.error('[NIT-RUES]', e.message);
+    res.status(500).json({ success: false, message: 'Error interno al consultar el RUES.' });
+  }
+});
+
 router.get('/:nit', async (req, res) => {
   try {
     const nit = req.params.nit.replace(/\D/g, ''); // Limpia todo menos números
