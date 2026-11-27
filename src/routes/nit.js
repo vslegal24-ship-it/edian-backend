@@ -89,50 +89,44 @@ router.get('/:nit', async (req, res) => {
       });
     }
 
-    // Llama al servicio de sipos (que consume la DIAN internamente)
-    // Enviamos el Referer correcto para que no bloquee la petición
-    const response = await fetch(`https://sipos.com.co/api_rut.php?nit=${nit}`, {
-      headers: {
-        'Referer': 'https://sipos.com.co/consultarut.html',
-        'Origin': 'https://sipos.com.co',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      },
-      // Timeout de 10 segundos
-      signal: AbortSignal.timeout(10000)
+    // Fuente: datos abiertos del RUES (datos.gov.co).
+    // Nota: sipos.com.co ahora protege su API con reCAPTCHA; no se usa.
+    const response = await fetch(`https://www.datos.gov.co/resource/c82u-588k.json?nit=${nit}`, {
+      signal: AbortSignal.timeout(12000)
     });
 
     if (!response.ok) {
       return res.status(502).json({
         success: false,
-        message: 'Error al consultar la DIAN. Intente nuevamente.'
+        message: 'Error al consultar. Intente nuevamente.'
       });
     }
 
-    const data = await response.json();
+    const arr = await response.json();
+    const dvCalculado = calcularDV(nit);
 
-    if (!data.success) {
+    if (!Array.isArray(arr) || !arr.length) {
       return res.status(404).json({
         success: false,
-        message: `No se encontró información para el NIT ${nit} en la DIAN.`
+        message: `No se encontró información para el NIT ${nit}.`,
+        dv_calculado: dvCalculado
       });
     }
 
-    // Calcula el DV localmente para verificar contra el que devuelve la DIAN
-    const dvCalculado = calcularDV(nit);
-    const dvDian = parseInt(data.dv);
-    const dvCorrecto = dvCalculado === dvDian;
+    const d = arr[0];
+    const dvDian = d.digito_verificacion != null ? parseInt(d.digito_verificacion, 10) : dvCalculado;
 
-    // Construye respuesta enriquecida
     res.json({
       success: true,
       nit: nit,
       dv: dvDian,
       dv_calculado: dvCalculado,
-      dv_correcto: dvCorrecto, // true si el DV que escribió el usuario coincide con la DIAN
-      razon_social: data.razon_social || null,
-      email: limpiarEmail(data.email),
-      direccion: data.direccion || null,
-      ciudad: data.ciudad || null,
+      dv_correcto: dvCalculado === dvDian,
+      razon_social: d.razon_social || null,
+      estado: d.estado_matricula || null,
+      representante_legal: d.representante_legal || null,
+      email: null,
+      direccion: null,
       // Formato completo para mostrar en facturas
       nit_completo: `${nit}-${dvDian}`
     });
