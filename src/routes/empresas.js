@@ -145,6 +145,46 @@ router.put('/:id/asignar', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ── PUT /api/empresas/:id ── (admin: edita los datos de una empresa) ──
+// body: { nombre?, nit?, dv?, usuario_id?, usuario?, accessKey?, partnerId? }
+router.put('/:id', async (req, res) => {
+  const tok = userFromReq(req);
+  if (!tok || tok.rol !== 'admin') return res.status(403).json({ ok: false, message: 'Solo admin' });
+  try {
+    const b = req.body || {};
+    const upd = {};
+    if (b.nombre !== undefined)     upd.nombre = String(b.nombre || '').trim() || null;
+    if (b.nit !== undefined)        upd.nit = String(b.nit || '').replace(/\D/g, '') || null;
+    if (b.dv !== undefined)         upd.dv = String(b.dv || '').trim() || null;
+    if (b.usuario_id !== undefined) upd.usuario_id = b.usuario_id || null;
+
+    // Si envían nueva Access Key: validar en Siigo y cifrar (nunca se guarda en claro)
+    if (b.accessKey) {
+      const usuario = (b.usuario || '').trim();
+      if (!usuario) return res.status(400).json({ ok: false, message: 'Para cambiar la Access Key indica también el Usuario API (correo).' });
+      try { await verificarSiigo(usuario, b.accessKey, b.partnerId); }
+      catch (e) { return res.status(200).json({ ok: false, step: 'auth', message: 'No autenticó en Siigo: ' + e.message }); }
+      upd.siigo_usuario = usuario;
+      upd.siigo_access_key_enc = cifrar(b.accessKey);
+      upd.siigo_partner_id = (b.partnerId || '').replace(/\s+/g, '');
+    } else {
+      // Permite corregir usuario/partner sin tocar la key cifrada
+      if (b.usuario !== undefined)   upd.siigo_usuario = (b.usuario || '').trim() || null;
+      if (b.partnerId !== undefined) upd.siigo_partner_id = (b.partnerId || '').replace(/\s+/g, '');
+    }
+
+    if (!Object.keys(upd).length) return res.status(400).json({ ok: false, message: 'No hay cambios para guardar.' });
+
+    const { data, error } = await supabase.from('edian_empresas')
+      .update(upd).eq('id', req.params.id).select('id, nit, nombre, siigo_usuario').single();
+    if (error) throw error;
+    res.json({ ok: true, mensaje: '✅ Empresa actualizada.', empresa: data });
+  } catch (e) {
+    console.error('[EMPRESAS] editar:', e.message);
+    res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
 // ── DELETE /api/empresas/:id ── (desactiva) ──
 router.delete('/:id', async (req, res) => {
   try {
