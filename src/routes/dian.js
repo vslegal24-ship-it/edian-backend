@@ -16,7 +16,9 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const JWT_SECRET = process.env.JWT_SECRET || 'edian_jwt_secret_2025';
 const soloDigitos = s => String(s || '').replace(/\D/g, '');
 
-async function guardProceso(req, body) {
+async function guardProceso(req, body, opts) {
+  opts = opts || {};
+  const via = opts.via || 'rango';   // 'rango' = descarga por fechas | 'listado' = Excel subido | 'zips' = ZIP/archivos subidos
   body = body || {};
   const raw = (req.headers.authorization || '').replace('Bearer ', '');
   let payload = null;
@@ -24,10 +26,7 @@ async function guardProceso(req, body) {
   if (!payload) return { ok: false, status: 401, error: 'Debes iniciar sesión para procesar.' };
   if (payload.rol === 'admin') return { ok: true };
 
-  let nitToken = '';
-  try { nitToken = soloDigitos(parseTokenUrl(body.tokenUrl).nit); } catch (e) {}
-  if (!nitToken) return { ok: false, status: 400, error: 'El enlace del token de la DIAN no es válido.' };
-
+  // Datos frescos del usuario
   let rol = payload.rol, plan = payload.plan, demoUsado = false;
   try {
     const { data: u } = await supabase.from('edian_usuarios')
@@ -35,23 +34,35 @@ async function guardProceso(req, body) {
     if (u) { rol = u.rol || rol; plan = u.plan_id || plan; demoUsado = !!u.demo_usado; }
   } catch (e) {}
 
-  let nitsAsignados = [];
-  try {
-    const { data: emps } = await supabase.from('edian_empresas')
-      .select('nit').eq('usuario_id', payload.id).eq('activo', true);
-    nitsAsignados = (emps || []).map(e => soloDigitos(e.nit)).filter(Boolean);
-  } catch (e) {}
-
   const esPremium = plan === 'premium';
-  if (!esPremium && !nitsAsignados.includes(nitToken)) {
-    return { ok: false, status: 403,
-      error: 'El NIT del token (' + nitToken + ') no coincide con ninguna de tus empresas contratadas. Pide a tu administrador que registre esa empresa.' };
+
+  // Cruce NIT-token: solo cuando hay token DIAN en juego (rango/listado). Los ZIP ya vienen descargados.
+  if (via !== 'zips') {
+    let nitToken = '';
+    try { nitToken = soloDigitos(parseTokenUrl(body.tokenUrl).nit); } catch (e) {}
+    if (!nitToken) return { ok: false, status: 400, error: 'El enlace del token de la DIAN no es válido.' };
+    if (!esPremium) {
+      let nitsAsignados = [];
+      try {
+        const { data: emps } = await supabase.from('edian_empresas')
+          .select('nit').eq('usuario_id', payload.id).eq('activo', true);
+        nitsAsignados = (emps || []).map(e => soloDigitos(e.nit)).filter(Boolean);
+      } catch (e) {}
+      if (!nitsAsignados.includes(nitToken)) {
+        return { ok: false, status: 403,
+          error: 'El NIT del token (' + nitToken + ') no coincide con ninguna de tus empresas contratadas. Pide a tu administrador que registre esa empresa.' };
+      }
+    }
   }
 
+  // Límites del rol de prueba (demo): 1 token, 1 NIT, 1 mes, 1 sola vez, y SOLO por rango de fechas
   if (rol === 'demo') {
     if (demoUsado) return { ok: false, status: 403, error: 'Ya usaste tu prueba gratuita. Contáctanos para activar tu plan.' };
+    if (via !== 'rango') {
+      return { ok: false, status: 403, error: 'La prueba solo permite la descarga por rango de fechas de un mes. No admite subir listados ni ZIP.' };
+    }
     const a = String(body.fechaInicio || '').slice(0, 7), b = String(body.fechaFin || '').slice(0, 7);
-    if (a && b && a !== b) {
+    if (!a || !b || a !== b) {
       return { ok: false, status: 403, error: 'La prueba permite procesar un solo mes. Selecciona un rango dentro del mismo mes.' };
     }
     try { await supabase.from('edian_usuarios').update({ demo_usado: true }).eq('id', payload.id); } catch (e) {}
@@ -114,7 +125,7 @@ router.post('/descargar', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'tokenUrl, fechaInicio y fechaFin son requeridos' });
   }
 
-  const g = await guardProceso(req, req.body);
+  const g = await guardProceso(req, req.body, { via: 'rango' });
   if (!g.ok) return res.status(g.status).json({ ok: false, error: g.error });
 
   if (req.body.async) {
@@ -156,7 +167,7 @@ router.post('/listar', async (req, res) => {
   if (!tokenUrl || !fechaInicio || !fechaFin) {
     return res.status(400).json({ ok: false, error: 'tokenUrl, fechaInicio y fechaFin son requeridos' });
   }
-  const g = await guardProceso(req, req.body);
+  const g = await guardProceso(req, req.body, { via: 'rango' });
   if (!g.ok) return res.status(g.status).json({ ok: false, error: g.error });
   if ([...jobs.values()].some(j => j.estado === 'procesando')) {
     return res.status(429).json({ ok: false, error: 'Ya hay un proceso en curso. Espera a que termine.' });
@@ -192,7 +203,7 @@ router.post('/descargar-listado', subida.single('listado'), async (req, res) => 
     const { tokenUrl } = req.body;
     if (!tokenUrl) return res.status(400).json({ ok: false, error: 'Falta el token de la DIAN' });
     if (!req.file) return res.status(400).json({ ok: false, error: 'Falta el archivo del listado (Excel)' });
-    const g = await guardProceso(req, req.body);
+    const g = await guardProceso(req, req.body, { via: 'listado' });
     if (!g.ok) return res.status(g.status).json({ ok: false, error: g.error });
     if ([...jobs.values()].some(j => j.estado === 'procesando')) {
       return res.status(429).json({ ok: false, error: 'Ya hay una descarga en curso. Espera a que termine.' });
@@ -242,6 +253,8 @@ function nombreArchivo(fac) {
 router.post('/procesar-zips', subida.array('archivos', 1000), async (req, res) => {
   try {
     if (!req.files || !req.files.length) return res.status(400).json({ ok: false, error: 'No se recibieron archivos' });
+    const g = await guardProceso(req, req.body, { via: 'zips' });
+    if (!g.ok) return res.status(g.status).json({ ok: false, error: g.error });
     const empresa = req.body.empresa || 'EDIAN';
     const fechaInicio = req.body.fechaInicio || '';
     const fechaFin = req.body.fechaFin || '';
