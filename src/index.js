@@ -9,6 +9,8 @@ const nitRoutes   = require('./routes/nit');
 const siigoRoutes = require('./routes/siigo');
 const empresasRoutes = require('./routes/empresas');
 const solicitudesRoutes = require('./routes/solicitudes');
+const calendarioRoutes = require('./routes/calendario');
+const contabilizacionRoutes = require('./routes/contabilizacion');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -47,6 +49,8 @@ app.use('/api/nit',   nitRoutes);
 app.use('/api/siigo', siigoRoutes);
 app.use('/api/empresas', empresasRoutes);
 app.use('/api/solicitudes', solicitudesRoutes);
+app.use('/api/calendario', calendarioRoutes);
+app.use('/api/contabilizacion', contabilizacionRoutes);
 
 // ── Error handler ───────────────────────────────────────────
 app.use((err, req, res, next) => {
